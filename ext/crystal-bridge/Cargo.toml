@@ -1,0 +1,22 @@
+[package]
+name = "temporalio-crystal-bridge"
+version = "0.1.0"
+edition = "2021"
+
+[lib]
+crate-type = ["cdylib"]
+name = "temporalio_crystal"
+
+[dependencies]
+temporalio-sdk-core = { path = "../sdk-core/crates/sdk-core", features = ["ephemeral-server"] }
+temporalio-client = { path = "../sdk-core/crates/client" }
+temporalio-common = { path = "../sdk-core/crates/common" }
+tokio = { version = "1", features = ["full"] }
+prost = "0.14"
+url = "2.5"
+tonic = "0.14"
+anyhow = "1.0"
+crossbeam-channel = "0.5"
+
+[build-dependencies]
+prost-build = "0.14"

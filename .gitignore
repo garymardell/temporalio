@@ -1,0 +1,22 @@
+/docs/
+/lib/
+/bin/
+/.shards/
+*.dwarf
+
+# Libraries don't need dependency lock
+# Dependencies will be locked in applications that use them
+/shard.lock
+
+# Build artifacts
+*.dwarf
+test_*
+!test_*.cr
+integration_spec
+libtest_callback.dylib
+
+# Benchmark results
+benchmark_results_*.txt
+
+# Compiled test binaries
+*_spec

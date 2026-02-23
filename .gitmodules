@@ -1,0 +1,3 @@
+[submodule "ext/sdk-core"]
+	path = ext/sdk-core
+	url = https://github.com/temporalio/sdk-core

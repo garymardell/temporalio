@@ -1,0 +1,25 @@
+name: temporalio
+version: 0.1.0
+
+authors:
+  - Gary Mardell <info@garymardell.co.uk>
+
+crystal: ">= 1.11.2"
+
+license: MIT
+
+dependencies:
+  protobuf:
+    github: jeromegn/protobuf.cr
+    version: "~> 2.0"
+  db:
+    github: crystal-lang/crystal-db
+    version: "~> 0.13.0"
+
+development_dependencies:
+  ameba:
+    github: crystal-ameba/ameba
+    version: "~> 1.6"
+
+scripts:
+  postinstall: crystal ./scripts/build.cr
