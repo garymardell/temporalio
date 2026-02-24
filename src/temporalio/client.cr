@@ -7,6 +7,7 @@ require "./client/options"
 require "./client/workflow_handle"
 require "./client/update_handle"
 require "./client_pool"
+require "./interceptor/client_interceptor"
 
 module Temporalio
   # High-level client for interacting with the Temporal server.
@@ -29,10 +30,13 @@ module Temporalio
     getter identity : String
     getter data_converter : DataConverter
 
+    # Client-side interceptors applied to all outbound calls.
+    getter interceptors : Array(Interceptor::ClientInterceptor)
+
     # Internal bridge client — exposed for WorkflowHandle to call workflow_service_call.
     # Will be nil if using a connection pool.
     protected getter bridge_client : Bridge::Client?
-    
+
     # Internal connection pool — used when client is created with connect_with_pool
     protected getter client_pool : ClientPool?
 
@@ -45,7 +49,8 @@ module Temporalio
       tls : TlsOptions? = nil,
       data_converter : DataConverter = DataConverter::DEFAULT,
       keep_alive : KeepAliveOptions? = nil,
-      metadata : Hash(String, String) = Hash(String, String).new
+      metadata : Hash(String, String) = Hash(String, String).new,
+      interceptors : Array(Interceptor::ClientInterceptor) = [] of Interceptor::ClientInterceptor
     ) : self
       opts = ConnectOptions.new(
         target_host: target_host,
@@ -57,10 +62,10 @@ module Temporalio
         keep_alive: keep_alive,
         metadata: metadata
       )
-      connect(opts)
+      connect(opts, interceptors)
     end
 
-    def self.connect(options : ConnectOptions) : self
+    def self.connect(options : ConnectOptions, interceptors : Array(Interceptor::ClientInterceptor) = [] of Interceptor::ClientInterceptor) : self
       runtime = Bridge::Runtime.new
 
       bridge_opts = Bridge::ClientOptions.new(
@@ -72,7 +77,7 @@ module Temporalio
       )
 
       bridge_client = Bridge::Client.connect(runtime, bridge_opts)
-      new(bridge_client, nil, options)
+      new(bridge_client, nil, options, interceptors)
     end
     
     # Connect to a Temporal server using a connection pool for improved throughput.
@@ -102,7 +107,8 @@ module Temporalio
       pool_size : Int32 = 5,
       initial_pool_size : Int32 = 1,
       keep_alive : KeepAliveOptions? = nil,
-      metadata : Hash(String, String) = Hash(String, String).new
+      metadata : Hash(String, String) = Hash(String, String).new,
+      interceptors : Array(Interceptor::ClientInterceptor) = [] of Interceptor::ClientInterceptor
     ) : self
       identity ||= "#{Process.pid}@#{System.hostname}"
       
@@ -136,13 +142,18 @@ module Temporalio
         metadata: metadata
       )
       
-      new(nil, pool, opts)
+      new(nil, pool, opts, interceptors)
     end
 
-    def initialize(@bridge_client : Bridge::Client?, @client_pool : ClientPool?, options : ConnectOptions)
+    def initialize(
+      @bridge_client : Bridge::Client?,
+      @client_pool : ClientPool?,
+      options : ConnectOptions,
+      @interceptors : Array(Interceptor::ClientInterceptor) = [] of Interceptor::ClientInterceptor
+    )
       # Must have either a bridge client or a pool, but not both
       raise ArgumentError.new("Must provide either bridge_client or client_pool") if @bridge_client.nil? && @client_pool.nil?
-      
+
       @namespace = options.namespace
       @identity = options.identity
       @data_converter = options.data_converter
@@ -155,6 +166,9 @@ module Temporalio
 
     # Start a workflow execution and return a WorkflowHandle.
     # The workflow_type is a string name (or use a class that responds to .workflow_type).
+    #
+    # Pass start_signal and optionally start_signal_args to atomically start the workflow
+    # and deliver an initial signal in one operation (signal-with-start).
     def start_workflow(
       workflow_type : String,
       *args,
@@ -170,9 +184,46 @@ module Temporalio
       memo : Hash(String, String)? = nil,
       search_attributes : Hash(String, String)? = nil,
       start_delay : Time::Span? = nil,
-      request_id : String? = nil
+      request_id : String? = nil,
+      start_signal : String? = nil,
+      start_signal_args : Array? = nil,
+      static_summary : String? = nil,
+      static_details : String? = nil
     ) : WorkflowHandle
       input_payloads = args.to_a.map { |a| @data_converter.to_payload(a).as(Temporal::Api::Common::V1::Payload) }
+
+      # Use signal-with-start when a start_signal is provided
+      if sig_name = start_signal
+        sig_payloads = (start_signal_args || [] of String).map { |a| @data_converter.to_payload(a).as(Temporal::Api::Common::V1::Payload) }
+        req = Temporal::Api::Workflowservice::V1::SignalWithStartWorkflowExecutionRequest.new(
+          namespace: @namespace,
+          workflow_id: id,
+          workflow_type: Temporal::Api::Common::V1::WorkflowType.new(name: workflow_type),
+          task_queue: Temporal::Api::Taskqueue::V1::TaskQueue.new(name: task_queue),
+          input: input_payloads.empty? ? nil : Temporal::Api::Common::V1::Payloads.new(payloads: input_payloads),
+          workflow_execution_timeout: span_to_duration(execution_timeout),
+          workflow_run_timeout: span_to_duration(run_timeout),
+          workflow_task_timeout: span_to_duration(task_timeout),
+          identity: @identity,
+          request_id: request_id || UUID.random.to_s,
+          workflow_id_reuse_policy: id_reuse_policy,
+          workflow_id_conflict_policy: id_conflict_policy,
+          retry_policy: retry_policy ? convert_retry_policy(retry_policy) : nil,
+          cron_schedule: cron_schedule,
+          memo: memo ? build_memo(memo) : nil,
+          search_attributes: search_attributes ? build_search_attributes(search_attributes) : nil,
+          signal_name: sig_name,
+          signal_input: sig_payloads.empty? ? nil : Temporal::Api::Common::V1::Payloads.new(payloads: sig_payloads)
+        )
+        resp_bytes = workflow_service_call("SignalWithStartWorkflowExecution", req.to_protobuf.to_slice)
+        resp = Temporal::Api::Workflowservice::V1::SignalWithStartWorkflowExecutionResponse.from_protobuf(IO::Memory.new(resp_bytes))
+        return WorkflowHandle.new(
+          client: self,
+          workflow_id: id,
+          run_id: resp.run_id,
+          result_run_id: resp.run_id
+        )
+      end
 
       req = Temporal::Api::Workflowservice::V1::StartWorkflowExecutionRequest.new(
         namespace: @namespace,
@@ -244,7 +295,11 @@ module Temporalio
       memo : Hash(String, String)? = nil,
       search_attributes : Hash(String, String)? = nil,
       start_delay : Time::Span? = nil,
-      request_id : String? = nil
+      request_id : String? = nil,
+      start_signal : String? = nil,
+      start_signal_args : Array? = nil,
+      static_summary : String? = nil,
+      static_details : String? = nil
     ) : String?
       handle = start_workflow(
         workflow_type, *args,
@@ -260,7 +315,11 @@ module Temporalio
         memo: memo,
         search_attributes: search_attributes,
         start_delay: start_delay,
-        request_id: request_id
+        request_id: request_id,
+        start_signal: start_signal,
+        start_signal_args: start_signal_args,
+        static_summary: static_summary,
+        static_details: static_details
       )
       handle.result
     end
@@ -514,13 +573,30 @@ module Temporalio
 
     # Count workflows matching a query.
     def count_workflows(query : String = "") : Int64
-      req = Temporal::Api::Workflowservice::V1::CountWorkflowExecutionsRequest.new(
-        namespace: @namespace,
-        query: query
-      )
-      resp_bytes = workflow_service_call("CountWorkflowExecutions", req.to_protobuf.to_slice)
-      resp = Temporal::Api::Workflowservice::V1::CountWorkflowExecutionsResponse.from_protobuf(IO::Memory.new(resp_bytes))
-      resp.count || 0_i64
+      input = Interceptor::CountWorkflowsInput.new(query: query)
+      run_interceptors_count(input) do |inp|
+        req = Temporal::Api::Workflowservice::V1::CountWorkflowExecutionsRequest.new(
+          namespace: @namespace,
+          query: inp.query
+        )
+        resp_bytes = workflow_service_call("CountWorkflowExecutions", req.to_protobuf.to_slice)
+        resp = Temporal::Api::Workflowservice::V1::CountWorkflowExecutionsResponse.from_protobuf(IO::Memory.new(resp_bytes))
+        resp.count || 0_i64
+      end
+    end
+
+    # Run a chain of interceptors for count_workflows, returning Int64.
+    private def run_interceptors_count(
+      input : Interceptor::CountWorkflowsInput,
+      &inner : Interceptor::CountWorkflowsInput -> Int64
+    ) : Int64
+      chain = @interceptors.reverse
+      fn = chain.reduce(inner) do |next_fn, interceptor|
+        Proc(Interceptor::CountWorkflowsInput, Int64).new do |i|
+          interceptor.count_workflows(i, next_fn)
+        end
+      end
+      fn.call(input)
     end
 
     # Internal: make a workflow service RPC call.

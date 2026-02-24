@@ -133,14 +133,15 @@ class ScenarioWorkflow
     max_iterations = 3
 
     if index >= max_iterations
-      "continue_as_new:success:completed_#{index}_iterations"
-    else
-      workflow.sleep(200.milliseconds)
-      workflow.continue_as_new(
-        "continue_as_new",
-        params.merge({"index" => JSON::Any.new(index + 1)})
-      )
+      return "continue_as_new:success:completed_#{index}_iterations"
     end
+
+    workflow.sleep(200.milliseconds)
+    workflow.continue_as_new(
+      "continue_as_new",
+      params.merge({"index" => JSON::Any.new(index + 1)})
+    )
+    raise "unreachable"
   end
 
   private def execute_complex_pattern(params) : String
@@ -234,8 +235,8 @@ class SignalScenario
     "signals_received:#{@values.size}:#{@values.join(",")}"
   end
 
-  workflow_signal "add_value" do |value|
-    @values << value.to_s
+  workflow_signal "add_value", String do |value|
+    @values << value
   end
 
   workflow_signal "finish" do
@@ -255,11 +256,12 @@ class ContinueAsNewScenario
 
   def execute(counter : Int64, max : Int64) : Int64
     if counter >= max
-      counter
-    else
-      workflow.sleep(100.milliseconds)
-      workflow.continue_as_new(counter + 1, max)
+      return counter
     end
+
+    workflow.sleep(100.milliseconds)
+    workflow.continue_as_new(counter + 1, max)
+    raise "unreachable"
   end
 end
 
@@ -331,7 +333,7 @@ class QueryScenario
 
   def execute(steps : Int64) : String
     steps.times do |i|
-      @progress = i + 1
+      @progress = (i + 1).to_i32
       workflow.sleep(100.milliseconds)
     end
 

@@ -5,6 +5,7 @@ require "./internal/proto"
 require "./internal/activity_runner"
 require "./internal/failure_converter"
 require "./internal/workflow_runner"
+require "./interceptor/worker_interceptor"
 
 module Temporalio
   # Runs workflows and activities by polling the Temporal server.
@@ -39,10 +40,12 @@ module Temporalio
       workflows : Array(Internal::WorkflowDefinition) = [] of Internal::WorkflowDefinition,
       activities : Array(Internal::ActivityDefinition) = [] of Internal::ActivityDefinition,
       max_cached_workflows : Int32 = 1000,
-      max_concurrent_activities : Int32 = 100
+      max_concurrent_activities : Int32 = 100,
+      interceptors : Array(Interceptor::WorkerInterceptor) = [] of Interceptor::WorkerInterceptor
     )
       @client = client
       @max_concurrent_activities = max_concurrent_activities
+      @interceptors = interceptors
 
       @activity_index = {} of String => Internal::ActivityDefinition
       activities.each { |d| @activity_index[d.activity_name] = d }
@@ -66,7 +69,7 @@ module Temporalio
       @activity_semaphore = Channel(Nil).new(@max_concurrent_activities)
       @max_concurrent_activities.times { @activity_semaphore.send(nil) }
 
-      @workflow_runner = Internal::WorkflowRunner.new(client.data_converter, client.namespace, @task_queue)
+      @workflow_runner = Internal::WorkflowRunner.new(client.data_converter, client.namespace, @task_queue, interceptors)
       workflows.each { |d| @workflow_runner.register(d) }
       @has_workflows = !workflows.empty?
       @has_activities = !activities.empty?
@@ -229,7 +232,7 @@ module Temporalio
         return
       end
 
-      runner = Internal::ActivityRunner.new(@bridge_worker, @client.data_converter, task)
+      runner = Internal::ActivityRunner.new(@bridge_worker, @client.data_converter, task, Channel(Nil).new(1), @interceptors)
       runner.run(defn)
     end
 

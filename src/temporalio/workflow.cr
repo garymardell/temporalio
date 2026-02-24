@@ -1,11 +1,40 @@
 require "./internal/proto"
 require "./data_converter"
+require "./interceptor/worker_interceptor"
 
 class Fiber
   property temporalio_workflow_context : Temporalio::Workflow::Context?
 end
 
 module Temporalio
+  module Workflow
+    # Controls how a running activity reacts when the workflow requests cancellation.
+    enum ActivityCancellationType
+      # Request cancellation and move on immediately (default).
+      TRY_CANCEL = 0
+      # Wait for the activity to acknowledge cancellation before continuing.
+      WAIT_CANCELLATION_COMPLETED = 1
+      # Don't request cancellation at all — let the activity run to completion.
+      ABANDON = 2
+    end
+
+    # Controls how a running child workflow reacts when the parent requests cancellation.
+    enum ChildWorkflowCancellationType
+      ABANDON = 0
+      TRY_CANCEL = 1
+      WAIT_CANCELLATION_COMPLETED = 2
+      WAIT_CANCELLATION_REQUESTED = 3
+    end
+
+    # Controls what happens to a child workflow when its parent workflow closes.
+    enum ParentClosePolicy
+      UNSPECIFIED = 0
+      TERMINATE = 1
+      ABANDON = 2
+      REQUEST_CANCEL = 3
+    end
+  end
+
   # Raised by Context#continue_as_new to signal the workflow runner.
   class ContinueAsNewError < Error
     getter workflow_type : String?
@@ -101,6 +130,21 @@ module Temporalio
       # Update validators registry (update_name => true if validator exists).
       {% unless @type.has_constant?("UPDATE_VALIDATORS") %}
         UPDATE_VALIDATORS = {} of String => Bool
+      {% end %}
+
+      # Whether a dynamic (catch-all) signal handler is registered.
+      {% unless @type.has_constant?("HAS_DYNAMIC_SIGNAL") %}
+        HAS_DYNAMIC_SIGNAL = false
+      {% end %}
+
+      # Whether a dynamic (catch-all) query handler is registered.
+      {% unless @type.has_constant?("HAS_DYNAMIC_QUERY") %}
+        HAS_DYNAMIC_QUERY = false
+      {% end %}
+
+      # Whether a dynamic (catch-all) update handler is registered.
+      {% unless @type.has_constant?("HAS_DYNAMIC_UPDATE") %}
+        HAS_DYNAMIC_UPDATE = false
       {% end %}
 
       # The finished hook auto-generates _temporal_execute after the class body completes.
@@ -366,6 +410,141 @@ module Temporalio
         end
       end
 
+      # Register a dynamic (catch-all) signal handler.
+      # Called for any signal whose name is not matched by a workflow_signal macro.
+      # The block receives (name : String, payloads : Array(Payload)).
+      #
+      # Usage:
+      #   workflow_dynamic_signal do |name, payloads|
+      #     @received[name] = payloads
+      #   end
+      macro workflow_dynamic_signal(&block)
+        \{% params = block.args %}
+        \{% body = block.body %}
+
+        def _temporal_dynamic_signal_handler(
+          name : String,
+          payloads : Array(Temporal::Api::Common::V1::Payload),
+          converter : Temporalio::DataConverter
+        ) : Nil
+          \{% if params.size >= 2 %}
+            \{{params[0]}} = name
+            \{{params[1]}} = payloads
+          \{% elsif params.size == 1 %}
+            \{{params[0]}} = name
+          \{% end %}
+          \{{body}}
+        end
+
+        \{% HAS_DYNAMIC_SIGNAL = true %}
+
+        def _temporal_handle_signal(
+          name : String,
+          payloads : Array(Temporal::Api::Common::V1::Payload),
+          converter : Temporalio::DataConverter
+        ) : Nil
+          case name
+          \{% for sn in REGISTERED_SIGNALS %}
+          when \{{sn}}
+            _temporal_signal_handler_\{{sn.gsub(/-/, "_").id}}(payloads, converter)
+          \{% end %}
+          else
+            _temporal_dynamic_signal_handler(name, payloads, converter)
+          end
+        end
+      end
+
+      # Register a dynamic (catch-all) query handler.
+      # Called for any query whose name is not matched by a workflow_query macro.
+      # The block receives (name : String, payloads : Array(Payload)) and must return a payload.
+      #
+      # Usage:
+      #   workflow_dynamic_query do |name, payloads| : String
+      #     "unknown query: #{name}"
+      #   end
+      macro workflow_dynamic_query(&block)
+        \{% params = block.args %}
+        \{% body = block.body %}
+
+        def _temporal_dynamic_query_handler(
+          name : String,
+          payloads : Array(Temporal::Api::Common::V1::Payload),
+          converter : Temporalio::DataConverter
+        ) : Temporal::Api::Common::V1::Payload?
+          \{% if params.size >= 2 %}
+            \{{params[0]}} = name
+            \{{params[1]}} = payloads
+          \{% elsif params.size == 1 %}
+            \{{params[0]}} = name
+          \{% end %}
+          result = begin \{{body}} end
+          converter.to_payload(result)
+        end
+
+        \{% HAS_DYNAMIC_QUERY = true %}
+
+        def _temporal_handle_query(
+          query_id : String,
+          name : String,
+          payloads : Array(Temporal::Api::Common::V1::Payload),
+          converter : Temporalio::DataConverter
+        ) : Temporal::Api::Common::V1::Payload?
+          case name
+          \{% for qn in REGISTERED_QUERIES %}
+          when \{{qn}}
+            _temporal_query_handler_\{{qn.gsub(/-/, "_").id}}(payloads, converter)
+          \{% end %}
+          else
+            _temporal_dynamic_query_handler(name, payloads, converter)
+          end
+        end
+      end
+
+      # Register a dynamic (catch-all) update handler.
+      # Called for any update whose name is not matched by a workflow_update macro.
+      # The block receives (name : String, payloads : Array(Payload)).
+      #
+      # Usage:
+      #   workflow_dynamic_update do |name, payloads|
+      #     @events << name
+      #   end
+      macro workflow_dynamic_update(&block)
+        \{% params = block.args %}
+        \{% body = block.body %}
+
+        def _temporal_dynamic_update_handler(
+          name : String,
+          payloads : Array(Temporal::Api::Common::V1::Payload),
+          converter : Temporalio::DataConverter
+        ) : Temporal::Api::Common::V1::Payload?
+          \{% if params.size >= 2 %}
+            \{{params[0]}} = name
+            \{{params[1]}} = payloads
+          \{% elsif params.size == 1 %}
+            \{{params[0]}} = name
+          \{% end %}
+          result = begin \{{body}} end
+          converter.to_payload(result)
+        end
+
+        \{% HAS_DYNAMIC_UPDATE = true %}
+
+        def _temporal_handle_update(
+          name : String,
+          payloads : Array(Temporal::Api::Common::V1::Payload),
+          converter : Temporalio::DataConverter
+        ) : Temporal::Api::Common::V1::Payload?
+          case name
+          \{% for un in REGISTERED_UPDATES %}
+          when \{{un}}
+            _temporal_update_handler_\{{un.gsub(/-/, "_").id}}(payloads, converter)
+          \{% end %}
+          else
+            _temporal_dynamic_update_handler(name, payloads, converter)
+          end
+        end
+      end
+
       # Handle a signal before fiber resume (instance-level dispatch).
       # Default: silently ignore unknown signals.
       # Overridden by workflow_signal macro with typed dispatch.
@@ -457,6 +636,41 @@ module Temporalio
       # Use this instead of Random::DEFAULT to keep workflows deterministic.
       getter random : Random
 
+      # Maximum time the entire workflow execution is allowed to run (nil if not set).
+      getter execution_timeout : Time::Span?
+
+      # Maximum time for a single run of the workflow (nil if not set).
+      getter run_timeout : Time::Span?
+
+      # Maximum time for a single workflow task (nil if not set).
+      getter task_timeout : Time::Span?
+
+      # The retry policy configured for this workflow (nil if not set).
+      getter retry_policy : Client::RetryPolicy?
+
+      # The cron schedule string if this workflow was started as a cron workflow (nil otherwise).
+      getter cron_schedule : String?
+
+      # Memo key/value pairs set when the workflow was started.
+      getter memo : Hash(String, Array(Temporal::Api::Common::V1::Payload))
+
+      # Search attributes set on the workflow.
+      getter search_attributes : Hash(String, Array(Temporal::Api::Common::V1::Payload))
+
+      # Root workflow execution (the top-level workflow for a chain of child workflows).
+      getter root_workflow : RootInfo?
+
+      # First execution run ID (the run ID of the very first run in a continue-as-new chain).
+      getter first_execution_run_id : String?
+
+      struct RootInfo
+        getter workflow_id : String
+        getter run_id : String
+
+        def initialize(@workflow_id, @run_id)
+        end
+      end
+
       # Parent workflow reference, populated when this workflow runs as a child.
       struct ParentInfo
         getter namespace : String
@@ -494,6 +708,9 @@ module Temporalio
       # Pending updates waiting for handler execution.
       @pending_updates : Hash(String, PendingUpdate)
 
+      # Worker-side interceptors for outbound workflow operations.
+      @interceptors : Array(Interceptor::WorkerInterceptor)
+
       struct PendingUpdate
         property protocol_instance_id : String
         property name : String
@@ -521,7 +738,17 @@ module Temporalio
         @replaying : Bool,
         random_seed : UInt64,
         @resume_channel : Channel(Nil),
-        @suspended_channel : Channel(Nil)
+        @suspended_channel : Channel(Nil),
+        @execution_timeout : Time::Span? = nil,
+        @run_timeout : Time::Span? = nil,
+        @task_timeout : Time::Span? = nil,
+        @retry_policy : Client::RetryPolicy? = nil,
+        @cron_schedule : String? = nil,
+        @memo : Hash(String, Array(Temporal::Api::Common::V1::Payload)) = {} of String => Array(Temporal::Api::Common::V1::Payload),
+        @search_attributes : Hash(String, Array(Temporal::Api::Common::V1::Payload)) = {} of String => Array(Temporal::Api::Common::V1::Payload),
+        @root_workflow : RootInfo? = nil,
+        @first_execution_run_id : String? = nil,
+        @interceptors : Array(Interceptor::WorkerInterceptor) = [] of Interceptor::WorkerInterceptor
       )
         @random = Random.new(random_seed.to_i64)
         @commands = [] of Coresdk::WorkflowCommands::WorkflowCommand
@@ -637,12 +864,27 @@ module Temporalio
       ) : Nil
         @pending_updates.each do |protocol_instance_id, update|
           begin
-            # Execute handler (can yield, use workflow operations)
-            result = workflow_object._temporal_handle_update(
-              update.name,
-              update.input,
-              data_converter
+            # Thread through handle_update interceptors
+            update_input = Interceptor::HandleUpdateInput.new(
+              update_id: protocol_instance_id,
+              update_name: update.name,
+              args: update.input
             )
+            chain = @interceptors.reverse
+            inner_fn = Proc(Interceptor::HandleUpdateInput, Temporal::Api::Common::V1::Payload?).new do |inp|
+              workflow_object._temporal_handle_update(
+                inp.update_name,
+                inp.args,
+                data_converter
+              )
+            end
+            update_fn = chain.reduce(inner_fn) do |next_fn, interceptor|
+              Proc(Interceptor::HandleUpdateInput, Temporal::Api::Common::V1::Payload?).new do |i|
+                interceptor.handle_update(i, next_fn)
+              end
+            end
+            # Execute handler (can yield, use workflow operations)
+            result = update_fn.call(update_input)
 
             # Send Completed response
             enqueue_command(
@@ -779,9 +1021,11 @@ module Temporalio
         args : Array(Temporal::Api::Common::V1::Payload) = [] of Temporal::Api::Common::V1::Payload,
         task_queue : String? = nil,
         schedule_to_close_timeout : Time::Span? = nil,
+        schedule_to_start_timeout : Time::Span? = nil,
         start_to_close_timeout : Time::Span? = nil,
         heartbeat_timeout : Time::Span? = nil,
-        retry_policy : Client::RetryPolicy? = nil
+        retry_policy : Client::RetryPolicy? = nil,
+        cancellation_type : ActivityCancellationType = ActivityCancellationType::TRY_CANCEL
       ) : Temporal::Api::Common::V1::Payload?
         seq = alloc_seq
         resolution_ch = Channel(Coresdk::ActivityResult::ActivityResolution).new(1)
@@ -807,9 +1051,11 @@ module Temporalio
             task_queue: target_task_queue,
             arguments: args,
             schedule_to_close_timeout: span_to_duration(schedule_to_close_timeout),
+            schedule_to_start_timeout: span_to_duration(schedule_to_start_timeout),
             start_to_close_timeout: span_to_duration(start_to_close_timeout),
             heartbeat_timeout: span_to_duration(heartbeat_timeout),
-            retry_policy: proto_retry_policy
+            retry_policy: proto_retry_policy,
+            cancellation_type: cancellation_type.value
           )
         )
 
@@ -847,8 +1093,10 @@ module Temporalio
         activity_type : String,
         args : Array(Temporal::Api::Common::V1::Payload) = [] of Temporal::Api::Common::V1::Payload,
         schedule_to_close_timeout : Time::Span? = nil,
+        schedule_to_start_timeout : Time::Span? = nil,
         start_to_close_timeout : Time::Span? = nil,
-        retry_policy : Client::RetryPolicy? = nil
+        retry_policy : Client::RetryPolicy? = nil,
+        cancellation_type : ActivityCancellationType = ActivityCancellationType::TRY_CANCEL
       ) : Temporal::Api::Common::V1::Payload?
         seq = alloc_seq
         resolution_ch = Channel(Coresdk::ActivityResult::ActivityResolution).new(1)
@@ -861,7 +1109,9 @@ module Temporalio
             activity_type: activity_type,
             arguments: args,
             schedule_to_close_timeout: span_to_duration(schedule_to_close_timeout),
-            start_to_close_timeout: span_to_duration(start_to_close_timeout)
+            schedule_to_start_timeout: span_to_duration(schedule_to_start_timeout),
+            start_to_close_timeout: span_to_duration(start_to_close_timeout),
+            cancellation_type: cancellation_type.value
           )
         )
 
@@ -890,8 +1140,27 @@ module Temporalio
         task_timeout : Time::Span? = nil,
         id_reuse_policy : Int32 = 0,
         retry_policy : Client::RetryPolicy? = nil,
-        cron_schedule : String? = nil
+        cron_schedule : String? = nil,
+        cancellation_type : ChildWorkflowCancellationType = ChildWorkflowCancellationType::WAIT_CANCELLATION_COMPLETED,
+        parent_close_policy : ParentClosePolicy = ParentClosePolicy::TERMINATE,
+        memo : Hash(String, String)? = nil,
+        search_attributes : Hash(String, String)? = nil
       ) : Temporal::Api::Common::V1::Payload?
+        # Notify interceptors (observation only — execution always proceeds)
+        intercept_input = Interceptor::ExecuteChildWorkflowInput.new(
+          workflow_type: workflow_type,
+          args: args,
+          workflow_id: workflow_id,
+          task_queue: task_queue
+        )
+        chain = @interceptors.reverse
+        inner_notify = Proc(Interceptor::ExecuteChildWorkflowInput, Nil).new { |_| nil }
+        notify_fn = chain.reduce(inner_notify) do |next_fn, interceptor|
+          Proc(Interceptor::ExecuteChildWorkflowInput, Nil).new do |i|
+            interceptor.execute_child_workflow(i, next_fn)
+          end
+        end
+        notify_fn.call(intercept_input)
         seq = alloc_seq
         child_wf_id = workflow_id || "#{@workflow_id}-child-#{seq}"
 
@@ -899,6 +1168,29 @@ module Temporalio
         complete_ch = Channel(Coresdk::ChildWorkflow::ChildWorkflowResult).new(1)
         @pending_child_start[seq] = start_ch
         @pending_child_complete[seq] = complete_ch
+
+        proto_retry_policy_child = if retry_policy
+          Temporal::Api::Common::V1::RetryPolicy.new(
+            initial_interval: span_to_duration(retry_policy.initial_interval),
+            backoff_coefficient: retry_policy.backoff_coefficient,
+            maximum_interval: span_to_duration(retry_policy.maximum_interval),
+            maximum_attempts: retry_policy.maximum_attempts
+          )
+        end
+
+        proto_memo = if memo
+          entries = memo.map do |k, v|
+            Coresdk::WorkflowCommands::StringPayloadEntry.new(key: k, value: @data_converter.to_payload(v))
+          end
+          entries
+        end
+
+        proto_search_attrs = if search_attributes
+          entries = search_attributes.map do |k, v|
+            Coresdk::WorkflowCommands::StringPayloadEntry.new(key: k, value: @data_converter.to_payload(v))
+          end
+          entries
+        end
 
         @commands << Coresdk::WorkflowCommands::WorkflowCommand.new(
           start_child_workflow_execution: Coresdk::WorkflowCommands::StartChildWorkflowExecution.new(
@@ -910,7 +1202,13 @@ module Temporalio
             workflow_execution_timeout: span_to_duration(execution_timeout),
             workflow_run_timeout: span_to_duration(run_timeout),
             workflow_task_timeout: span_to_duration(task_timeout),
-            workflow_id_reuse_policy: id_reuse_policy
+            workflow_id_reuse_policy: id_reuse_policy,
+            retry_policy: proto_retry_policy_child,
+            cron_schedule: cron_schedule,
+            cancellation_type: cancellation_type.value,
+            parent_close_policy: parent_close_policy.value,
+            memo: proto_memo,
+            search_attributes: proto_search_attrs
           )
         )
 
@@ -976,6 +1274,32 @@ module Temporalio
         run_id : String? = nil,
         namespace : String? = nil
       ) : Nil
+        intercept_input = Interceptor::SignalExternalWorkflowInput.new(
+          workflow_id: workflow_id,
+          signal_name: signal_name,
+          args: args,
+          run_id: run_id,
+          namespace: namespace
+        )
+        chain = @interceptors.reverse
+        inner = Proc(Interceptor::SignalExternalWorkflowInput, Nil).new do |inp|
+          do_signal_external_workflow(inp.workflow_id, inp.signal_name, inp.args, inp.run_id, inp.namespace)
+        end
+        fn = chain.reduce(inner) do |next_fn, interceptor|
+          Proc(Interceptor::SignalExternalWorkflowInput, Nil).new do |i|
+            interceptor.signal_external_workflow(i, next_fn)
+          end
+        end
+        fn.call(intercept_input)
+      end
+
+      private def do_signal_external_workflow(
+        workflow_id : String,
+        signal_name : String,
+        args : Array(Temporal::Api::Common::V1::Payload),
+        run_id : String?,
+        namespace : String?
+      ) : Nil
         seq = alloc_seq
         result_ch = Channel(Coresdk::WorkflowActivation::ResolveSignalExternalWorkflow).new(1)
         @pending_external_signals[seq] = result_ch
@@ -1011,6 +1335,30 @@ module Temporalio
         namespace : String? = nil,
         reason : String? = nil
       ) : Nil
+        intercept_input = Interceptor::CancelExternalWorkflowInput.new(
+          workflow_id: workflow_id,
+          run_id: run_id,
+          namespace: namespace,
+          reason: reason
+        )
+        chain = @interceptors.reverse
+        inner = Proc(Interceptor::CancelExternalWorkflowInput, Nil).new do |inp|
+          do_cancel_external_workflow(inp.workflow_id, inp.run_id, inp.namespace, inp.reason)
+        end
+        fn = chain.reduce(inner) do |next_fn, interceptor|
+          Proc(Interceptor::CancelExternalWorkflowInput, Nil).new do |i|
+            interceptor.cancel_external_workflow(i, next_fn)
+          end
+        end
+        fn.call(intercept_input)
+      end
+
+      private def do_cancel_external_workflow(
+        workflow_id : String,
+        run_id : String?,
+        namespace : String?,
+        reason : String?
+      ) : Nil
         seq = alloc_seq
         result_ch = Channel(Coresdk::WorkflowActivation::ResolveRequestCancelExternalWorkflow).new(1)
         @pending_external_cancels[seq] = result_ch
@@ -1039,6 +1387,20 @@ module Temporalio
 
       # Schedule a timer and yield until it fires.
       def sleep(duration : Time::Span) : Nil
+        input = Interceptor::StartTimerInput.new(duration: duration)
+        chain = @interceptors.reverse
+        inner = Proc(Interceptor::StartTimerInput, Nil).new do |inp|
+          do_sleep(inp.duration)
+        end
+        fn = chain.reduce(inner) do |next_fn, interceptor|
+          Proc(Interceptor::StartTimerInput, Nil).new do |i|
+            interceptor.start_timer(i, next_fn)
+          end
+        end
+        fn.call(input)
+      end
+
+      private def do_sleep(duration : Time::Span) : Nil
         seq = alloc_seq
         timer_ch = Channel(Nil).new(1)
         @pending_timers[seq] = timer_ch
@@ -1052,11 +1414,11 @@ module Temporalio
         )
 
         yield_to_poller
-        
+
         # Wait for timer to fire, checking cancellation on each activation
         until timer_fired
           check_cancellation!
-          
+
           # Check if timer has fired (non-blocking)
           select
           when timer_ch.receive
@@ -1095,14 +1457,28 @@ module Temporalio
         task_timeout : Time::Span? = nil
       ) : Nil
         encoded_args = raw_args.to_a.map { |a| @data_converter.to_payload(a).as(Temporal::Api::Common::V1::Payload) }
-        raise ContinueAsNewError.new(
-          args: encoded_args,
+        intercept_input = Interceptor::ContinueAsNewInput.new(
           workflow_type: workflow_type,
-          task_queue: task_queue || @task_queue,
-          execution_timeout: execution_timeout,
-          run_timeout: run_timeout,
-          task_timeout: task_timeout
+          args: encoded_args,
+          task_queue: task_queue || @task_queue
         )
+        chain = @interceptors.reverse
+        inner = Proc(Interceptor::ContinueAsNewInput, Nil).new do |inp|
+          raise ContinueAsNewError.new(
+            args: inp.args,
+            workflow_type: inp.workflow_type,
+            task_queue: inp.task_queue || @task_queue,
+            execution_timeout: execution_timeout,
+            run_timeout: run_timeout,
+            task_timeout: task_timeout
+          )
+        end
+        fn = chain.reduce(inner) do |next_fn, interceptor|
+          Proc(Interceptor::ContinueAsNewInput, Nil).new do |i|
+            interceptor.continue_as_new(i, next_fn)
+          end
+        end
+        fn.call(intercept_input)
       end
 
       # Resolve a timer fire job.

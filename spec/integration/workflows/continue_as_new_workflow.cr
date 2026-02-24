@@ -11,5 +11,6 @@ class ContinueAsNewWorkflow
     ctx = Temporalio::Workflow::Context.current
     # Continue as new with incremented counter
     ctx.continue_as_new(counter + 1, max)
+    raise "unreachable"
   end
 end

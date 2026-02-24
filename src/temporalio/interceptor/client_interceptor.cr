@@ -66,6 +66,48 @@ module Temporalio
       end
     end
 
+    struct DescribeWorkflowInput
+      getter workflow_id : String
+      getter run_id : String?
+
+      def initialize(@workflow_id : String, @run_id : String? = nil)
+      end
+    end
+
+    struct ListWorkflowsInput
+      getter query : String
+      getter page_size : Int32
+
+      def initialize(@query : String = "", @page_size : Int32 = 100)
+      end
+    end
+
+    struct CountWorkflowsInput
+      getter query : String
+
+      def initialize(@query : String = "")
+      end
+    end
+
+    struct StartUpdateInput
+      getter workflow_id : String
+      getter run_id : String?
+      getter update_name : String
+      getter args : Array(Temporal::Api::Common::V1::Payload)
+      getter update_id : String
+      getter wait_for_stage : Int32
+
+      def initialize(
+        @workflow_id : String,
+        @run_id : String?,
+        @update_name : String,
+        @args : Array(Temporal::Api::Common::V1::Payload),
+        @update_id : String,
+        @wait_for_stage : Int32 = 2
+      )
+      end
+    end
+
     # Base class for client-side interceptors.
     # Subclass and override only the methods you need; defaults pass through.
     class ClientInterceptor
@@ -100,6 +142,34 @@ module Temporalio
       def terminate_workflow(
         input : TerminateWorkflowInput,
         next_fn : Proc(TerminateWorkflowInput, Nil)
+      ) : Nil
+        next_fn.call(input)
+      end
+
+      def describe_workflow(
+        input : DescribeWorkflowInput,
+        next_fn : Proc(DescribeWorkflowInput, Nil)
+      ) : Nil
+        next_fn.call(input)
+      end
+
+      def list_workflows(
+        input : ListWorkflowsInput,
+        next_fn : Proc(ListWorkflowsInput, Nil)
+      ) : Nil
+        next_fn.call(input)
+      end
+
+      def count_workflows(
+        input : CountWorkflowsInput,
+        next_fn : Proc(CountWorkflowsInput, Int64)
+      ) : Int64
+        next_fn.call(input)
+      end
+
+      def start_update(
+        input : StartUpdateInput,
+        next_fn : Proc(StartUpdateInput, Nil)
       ) : Nil
         next_fn.call(input)
       end

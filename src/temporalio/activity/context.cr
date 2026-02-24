@@ -6,6 +6,32 @@ end
 
 module Temporalio
   module Activity
+    # Describes the reason why an activity's cancellation was requested.
+    struct ActivityCancellationDetails
+      # True if the workflow explicitly requested cancellation of this activity.
+      getter? cancel_requested : Bool
+      # True if the activity was not found by the server (e.g. activity ID mismatch).
+      getter? not_found : Bool
+      # True if the activity was paused.
+      getter? paused : Bool
+      # True if the activity was reset.
+      getter? reset : Bool
+      # True if the activity timed out.
+      getter? timed_out : Bool
+      # True if the worker is shutting down.
+      getter? worker_shutdown : Bool
+
+      def initialize(
+        @cancel_requested : Bool = false,
+        @not_found : Bool = false,
+        @paused : Bool = false,
+        @reset : Bool = false,
+        @timed_out : Bool = false,
+        @worker_shutdown : Bool = false
+      )
+      end
+    end
+
     # Per-activity execution context. Stored directly on the current fiber.
     # Access the current context via Context.current inside an activity.
     class Context
@@ -27,6 +53,7 @@ module Temporalio
       @cancel_requested : Bool = false
       @worker_shutdown : Bool = false
       @heartbeat_proc : Proc(Array(Temporal::Api::Common::V1::Payload), Nil)?
+      @cancellation_cause : Symbol = :cancel_requested
 
       def initialize(
         @info : ActivityInfo,
@@ -60,15 +87,30 @@ module Temporalio
         @worker_shutdown
       end
 
+      # Returns details about why cancellation was requested, or nil if not cancelled.
+      def cancellation_details : ActivityCancellationDetails?
+        return nil unless @cancel_requested
+        ActivityCancellationDetails.new(
+          cancel_requested: @cancellation_cause == :cancel_requested,
+          not_found: @cancellation_cause == :not_found,
+          paused: @cancellation_cause == :paused,
+          reset: @cancellation_cause == :reset,
+          timed_out: @cancellation_cause == :timed_out,
+          worker_shutdown: @cancellation_cause == :worker_shutdown
+        )
+      end
+
       # Internal: called when a cancel task arrives.
       def request_cancel! : Nil
         @cancel_requested = true
+        @cancellation_cause = :cancel_requested
       end
 
       # Internal: called when worker initiates shutdown.
       def notify_worker_shutdown! : Nil
         @worker_shutdown = true
         @cancel_requested = true
+        @cancellation_cause = :worker_shutdown
       end
 
       # Internal: register this context for the current fiber.

@@ -136,46 +136,66 @@ module Temporalio
       # or any JSON::Serializable object.
       def signal(signal_name : String, *args) : Nil
         input_payloads = args.to_a.map { |a| @client.data_converter.to_payload(a).as(Temporal::Api::Common::V1::Payload) }
-        req = Temporal::Api::Workflowservice::V1::SignalWorkflowExecutionRequest.new(
-          namespace: @client.namespace,
-          workflow_execution: Temporal::Api::Common::V1::WorkflowExecution.new(
-            workflow_id: @workflow_id,
-            run_id: @run_id || ""
-          ),
-          signal_name: signal_name,
-          input: input_payloads.empty? ? nil : Temporal::Api::Common::V1::Payloads.new(payloads: input_payloads),
-          identity: @client.identity,
-          request_id: new_request_id
+        input = Temporalio::Interceptor::SignalWorkflowInput.new(
+          workflow_id: @workflow_id,
+          run_id: @run_id,
+          signal: signal_name,
+          args: input_payloads
         )
-        @client.workflow_service_call("SignalWorkflowExecution", req.to_protobuf.to_slice)
+        run_interceptors_void(input, @client.interceptors) do |inp|
+          req = Temporal::Api::Workflowservice::V1::SignalWorkflowExecutionRequest.new(
+            namespace: @client.namespace,
+            workflow_execution: Temporal::Api::Common::V1::WorkflowExecution.new(
+              workflow_id: inp.workflow_id,
+              run_id: inp.run_id || ""
+            ),
+            signal_name: inp.signal,
+            input: inp.args.empty? ? nil : Temporal::Api::Common::V1::Payloads.new(payloads: inp.args),
+            identity: @client.identity,
+            request_id: new_request_id
+          )
+          @client.workflow_service_call("SignalWorkflowExecution", req.to_protobuf.to_slice)
+        end
       end
 
       # Queries the workflow. Returns the raw JSON result string.
       # Decode with your type: MyType.from_json(result).
       def query(query_type : String, *args, options : QueryOptions? = nil) : String?
         input_payloads = args.to_a.map { |a| @client.data_converter.to_payload(a).as(Temporal::Api::Common::V1::Payload) }
-        req = Temporal::Api::Workflowservice::V1::QueryWorkflowRequest.new(
-          namespace: @client.namespace,
-          execution: Temporal::Api::Common::V1::WorkflowExecution.new(
-            workflow_id: @workflow_id,
-            run_id: @run_id || ""
-          ),
-          query: Temporal::Api::Query::V1::WorkflowQuery.new(
-            query_type: query_type,
-            query_args: input_payloads.empty? ? nil : Temporal::Api::Common::V1::Payloads.new(payloads: input_payloads)
-          ),
-          query_reject_condition: options.try(&.reject_condition) || 0
+        input = Temporalio::Interceptor::QueryWorkflowInput.new(
+          workflow_id: @workflow_id,
+          run_id: @run_id,
+          query_type: query_type,
+          args: input_payloads
         )
-        resp_bytes = @client.workflow_service_call("QueryWorkflow", req.to_protobuf.to_slice)
-        resp = Temporal::Api::Workflowservice::V1::QueryWorkflowResponse.from_protobuf(IO::Memory.new(resp_bytes))
+        result_payload = run_interceptors_query(input, @client.interceptors) do |inp|
+          req = Temporal::Api::Workflowservice::V1::QueryWorkflowRequest.new(
+            namespace: @client.namespace,
+            execution: Temporal::Api::Common::V1::WorkflowExecution.new(
+              workflow_id: inp.workflow_id,
+              run_id: inp.run_id || ""
+            ),
+            query: Temporal::Api::Query::V1::WorkflowQuery.new(
+              query_type: inp.query_type,
+              query_args: inp.args.empty? ? nil : Temporal::Api::Common::V1::Payloads.new(payloads: inp.args)
+            ),
+            query_reject_condition: options.try(&.reject_condition) || 0
+          )
+          resp_bytes = @client.workflow_service_call("QueryWorkflow", req.to_protobuf.to_slice)
+          resp = Temporal::Api::Workflowservice::V1::QueryWorkflowResponse.from_protobuf(IO::Memory.new(resp_bytes))
 
-        if rejected = resp.query_rejected
-          raise Error.new("Query rejected: workflow status #{rejected.status}")
+          if rejected = resp.query_rejected
+            raise Error.new("Query rejected: workflow status #{rejected.status}")
+          end
+
+          resp.query_result.try { |qr| qr.payloads.try(&.first?) }
         end
 
-        values = @client.data_converter.from_payloads_message(resp.query_result)
+        return nil unless result_payload
+        values = @client.data_converter.from_payloads_message(
+          Temporal::Api::Common::V1::Payloads.new(payloads: [result_payload])
+        )
         json_result = values.first?
-        # Parse the JSON to get the actual value
         if json_result
           parsed = JSON.parse(json_result)
           return parsed.to_s
@@ -294,38 +314,61 @@ module Temporalio
 
       # Requests cancellation of the workflow.
       def cancel(reason : String? = nil) : Nil
-        req = Temporal::Api::Workflowservice::V1::RequestCancelWorkflowExecutionRequest.new(
-          namespace: @client.namespace,
-          workflow_execution: Temporal::Api::Common::V1::WorkflowExecution.new(
-            workflow_id: @workflow_id,
-            run_id: @run_id || ""
-          ),
-          identity: @client.identity,
-          request_id: new_request_id,
-          reason: reason || ""
+        input = Temporalio::Interceptor::CancelWorkflowInput.new(
+          workflow_id: @workflow_id,
+          run_id: @run_id,
+          reason: reason
         )
-        @client.workflow_service_call("RequestCancelWorkflowExecution", req.to_protobuf.to_slice)
+        run_interceptors_cancel(input, @client.interceptors) do |inp|
+          req = Temporal::Api::Workflowservice::V1::RequestCancelWorkflowExecutionRequest.new(
+            namespace: @client.namespace,
+            workflow_execution: Temporal::Api::Common::V1::WorkflowExecution.new(
+              workflow_id: inp.workflow_id,
+              run_id: inp.run_id || ""
+            ),
+            identity: @client.identity,
+            request_id: new_request_id,
+            reason: inp.reason || ""
+          )
+          @client.workflow_service_call("RequestCancelWorkflowExecution", req.to_protobuf.to_slice)
+        end
       end
 
       # Terminates the workflow.
       # Each detail arg is encoded via data_converter.to_payload.
       def terminate(reason : String? = nil, *details) : Nil
         detail_payloads = details.to_a.map { |d| @client.data_converter.to_payload(d).as(Temporal::Api::Common::V1::Payload) }
-        req = Temporal::Api::Workflowservice::V1::TerminateWorkflowExecutionRequest.new(
-          namespace: @client.namespace,
-          workflow_execution: Temporal::Api::Common::V1::WorkflowExecution.new(
-            workflow_id: @workflow_id,
-            run_id: @run_id || ""
-          ),
-          reason: reason || "",
-          details: detail_payloads.empty? ? nil : Temporal::Api::Common::V1::Payloads.new(payloads: detail_payloads),
-          identity: @client.identity
+        input = Temporalio::Interceptor::TerminateWorkflowInput.new(
+          workflow_id: @workflow_id,
+          run_id: @run_id,
+          reason: reason,
+          details: detail_payloads
         )
-        @client.workflow_service_call("TerminateWorkflowExecution", req.to_protobuf.to_slice)
+        run_interceptors_terminate(input, @client.interceptors) do |inp|
+          req = Temporal::Api::Workflowservice::V1::TerminateWorkflowExecutionRequest.new(
+            namespace: @client.namespace,
+            workflow_execution: Temporal::Api::Common::V1::WorkflowExecution.new(
+              workflow_id: inp.workflow_id,
+              run_id: inp.run_id || ""
+            ),
+            reason: inp.reason || "",
+            details: inp.details.empty? ? nil : Temporal::Api::Common::V1::Payloads.new(payloads: inp.details),
+            identity: @client.identity
+          )
+          @client.workflow_service_call("TerminateWorkflowExecution", req.to_protobuf.to_slice)
+        end
       end
 
       # Describes the current state of the workflow execution.
       def describe : WorkflowExecutionDescription
+        input = Temporalio::Interceptor::DescribeWorkflowInput.new(
+          workflow_id: @workflow_id,
+          run_id: @run_id
+        )
+        # describe_workflow interceptor is a pass-through notification; actual work done inside
+        @client.interceptors.each do |i|
+          i.describe_workflow(input, Proc(Temporalio::Interceptor::DescribeWorkflowInput, Nil).new { |_| nil })
+        end
         req = Temporal::Api::Workflowservice::V1::DescribeWorkflowExecutionRequest.new(
           namespace: @client.namespace,
           execution: Temporal::Api::Common::V1::WorkflowExecution.new(
@@ -348,6 +391,70 @@ module Temporalio
           history_length: info.try(&.history_length) || 0_i64,
           history_size_bytes: info.try(&.history_size_bytes) || 0_i64
         )
+      end
+
+      # Atomically starts (or reuses) a workflow and sends an update, returning an UpdateHandle.
+      # This ensures the workflow is running before the update is processed.
+      #
+      # The workflow_type, task_queue and args are the same as start_workflow.
+      # The start_workflow_operation defines how to start the workflow if it isn't already running.
+      #
+      # Usage:
+      #   op = Temporalio::Client::WithStartWorkflowOperation.new(
+      #     workflow_type: "MyWorkflow",
+      #     args: ["hello"],
+      #     id: "wf-1",
+      #     task_queue: "my-queue"
+      #   )
+      #   update_handle = handle.start_update_with_start("my-update", op)
+      #   result = update_handle.result
+      def start_update_with_start(
+        update_name : String,
+        start_operation : WithStartWorkflowOperation,
+        *args,
+        update_id : String? = nil
+      ) : UpdateHandle
+        # Start the workflow first (or get existing handle)
+        workflow_handle = start_operation.execute(@client)
+
+        # Then start the update on that workflow
+        uid = update_id || UUID.random.to_s
+        input_payloads = args.to_a.map { |a| @client.data_converter.to_payload(a).as(Temporal::Api::Common::V1::Payload) }
+
+        req = Temporal::Api::Workflowservice::V1::UpdateWorkflowExecutionRequest.new(
+          namespace: @client.namespace,
+          workflow_execution: Temporal::Api::Common::V1::WorkflowExecution.new(
+            workflow_id: workflow_handle.workflow_id,
+            run_id: workflow_handle.run_id || ""
+          ),
+          request: Temporal::Api::Update::V1::Request.new(
+            meta: Temporal::Api::Update::V1::Meta.new(
+              update_id: uid,
+              identity: @client.identity
+            ),
+            input: Temporal::Api::Update::V1::Input.new(
+              name: update_name,
+              args: input_payloads.empty? ? nil : Temporal::Api::Common::V1::Payloads.new(payloads: input_payloads)
+            )
+          ),
+          wait_policy: Temporal::Api::Update::V1::WaitPolicy.new(
+            lifecycle_stage: 2 # ACCEPTED
+          )
+        )
+
+        @client.workflow_service_call("UpdateWorkflowExecution", req.to_protobuf.to_slice)
+        UpdateHandle.new(@client, workflow_handle.workflow_id, workflow_handle.run_id, uid)
+      end
+
+      # Atomically starts (or reuses) a workflow and executes an update, waiting for it to complete.
+      def execute_update_with_start(
+        update_name : String,
+        start_operation : WithStartWorkflowOperation,
+        *args,
+        update_id : String? = nil
+      ) : String?
+        handle = start_update_with_start(update_name, start_operation, *args, update_id: update_id)
+        handle.result
       end
 
       private def fetch_history_close_event(run_id : String?) : Temporal::Api::Workflowservice::V1::GetWorkflowExecutionHistoryResponse
@@ -374,6 +481,66 @@ module Temporalio
         secs = ts.seconds || 0_i64
         nanos = ts.nanos || 0
         Time.unix(secs) + nanos.nanoseconds
+      end
+
+      # Run a chain of interceptors for a void signal operation.
+      private def run_interceptors_void(
+        input : Temporalio::Interceptor::SignalWorkflowInput,
+        interceptors : Array(Temporalio::Interceptor::ClientInterceptor),
+        &inner : Temporalio::Interceptor::SignalWorkflowInput -> Nil
+      ) : Nil
+        chain = interceptors.reverse
+        fn = chain.reduce(inner) do |next_fn, interceptor|
+          Proc(Temporalio::Interceptor::SignalWorkflowInput, Nil).new do |i|
+            interceptor.signal_workflow(i, next_fn)
+          end
+        end
+        fn.call(input)
+      end
+
+      # Run a chain of interceptors for query (returns Payload?).
+      private def run_interceptors_query(
+        input : Temporalio::Interceptor::QueryWorkflowInput,
+        interceptors : Array(Temporalio::Interceptor::ClientInterceptor),
+        &inner : Temporalio::Interceptor::QueryWorkflowInput -> Temporal::Api::Common::V1::Payload?
+      ) : Temporal::Api::Common::V1::Payload?
+        chain = interceptors.reverse
+        fn = chain.reduce(inner) do |next_fn, interceptor|
+          Proc(Temporalio::Interceptor::QueryWorkflowInput, Temporal::Api::Common::V1::Payload?).new do |i|
+            interceptor.query_workflow(i, next_fn)
+          end
+        end
+        fn.call(input)
+      end
+
+      # Run a chain of interceptors for cancel (void).
+      private def run_interceptors_cancel(
+        input : Temporalio::Interceptor::CancelWorkflowInput,
+        interceptors : Array(Temporalio::Interceptor::ClientInterceptor),
+        &inner : Temporalio::Interceptor::CancelWorkflowInput -> Nil
+      ) : Nil
+        chain = interceptors.reverse
+        fn = chain.reduce(inner) do |next_fn, interceptor|
+          Proc(Temporalio::Interceptor::CancelWorkflowInput, Nil).new do |i|
+            interceptor.cancel_workflow(i, next_fn)
+          end
+        end
+        fn.call(input)
+      end
+
+      # Run a chain of interceptors for terminate (void).
+      private def run_interceptors_terminate(
+        input : Temporalio::Interceptor::TerminateWorkflowInput,
+        interceptors : Array(Temporalio::Interceptor::ClientInterceptor),
+        &inner : Temporalio::Interceptor::TerminateWorkflowInput -> Nil
+      ) : Nil
+        chain = interceptors.reverse
+        fn = chain.reduce(inner) do |next_fn, interceptor|
+          Proc(Temporalio::Interceptor::TerminateWorkflowInput, Nil).new do |i|
+            interceptor.terminate_workflow(i, next_fn)
+          end
+        end
+        fn.call(input)
       end
     end
   end

@@ -3,6 +3,7 @@ require "../activity/activity_info"
 require "../data_converter"
 require "../internal/failure_converter"
 require "../internal/proto"
+require "../interceptor/worker_interceptor"
 
 module Temporalio
   module Internal
@@ -12,7 +13,8 @@ module Temporalio
         @bridge_worker : Bridge::Worker,
         @data_converter : DataConverter,
         @task : Coresdk::ActivityTask::ActivityTask,
-        @heartbeat_semaphore : Channel(Nil) = Channel(Nil).new(1)
+        @heartbeat_semaphore : Channel(Nil) = Channel(Nil).new(1),
+        @interceptors : Array(Temporalio::Interceptor::WorkerInterceptor) = [] of Temporalio::Interceptor::WorkerInterceptor
       )
       end
 
@@ -47,7 +49,23 @@ module Temporalio
 
         begin
           input_payloads = start.input || [] of Temporal::Api::Common::V1::Payload
-          result_payload = activity_class.execute_activity(input_payloads, @data_converter)
+
+          # Thread execute_activity through interceptors
+          intercept_input = Temporalio::Interceptor::ExecuteActivityInput.new(
+            activity_type: info.activity_type,
+            args: input_payloads,
+            task_token: task_token
+          )
+          chain = @interceptors.reverse
+          inner_fn = Proc(Temporalio::Interceptor::ExecuteActivityInput, Temporal::Api::Common::V1::Payload?).new do |inp|
+            activity_class.execute_activity(inp.args, @data_converter)
+          end
+          fn = chain.reduce(inner_fn) do |next_fn, interceptor|
+            Proc(Temporalio::Interceptor::ExecuteActivityInput, Temporal::Api::Common::V1::Payload?).new do |i|
+              interceptor.execute_activity(i, next_fn)
+            end
+          end
+          result_payload = fn.call(intercept_input)
         rescue ex : CancelledError
           failure = FailureConverter.to_failure(ex, @data_converter)
         rescue ex : Exception

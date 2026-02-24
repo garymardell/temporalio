@@ -2,6 +2,7 @@ require "../internal/proto"
 require "../internal/failure_converter"
 require "../data_converter"
 require "../workflow"
+require "../interceptor/worker_interceptor"
 
 module Temporalio
   module Internal
@@ -121,13 +122,15 @@ module Temporalio
       @workflow_fiber : Fiber
       @workflow_fiber_started : Bool = false
       @workflow_object : WorkflowObject
+      @interceptors : Array(Temporalio::Interceptor::WorkerInterceptor)
 
       def initialize(
         activation : Coresdk::WorkflowActivation::WorkflowActivation,
         @workflow_object : WorkflowObject,
         @data_converter : DataConverter,
         namespace : String,
-        task_queue : String
+        task_queue : String,
+        @interceptors : Array(Temporalio::Interceptor::WorkerInterceptor) = [] of Temporalio::Interceptor::WorkerInterceptor
       )
         @run_id = activation.run_id || ""
 
@@ -152,6 +155,10 @@ module Temporalio
         random_seed = init.try(&.randomness_seed) || 0_u64
         continued_run_id = init.try(&.continued_from_execution_run_id)
         continued_run_id = nil if continued_run_id && continued_run_id.empty?
+        first_execution_run_id = init.try(&.first_execution_run_id)
+        first_execution_run_id = nil if first_execution_run_id && first_execution_run_id.empty?
+        cron_schedule = init.try(&.cron_schedule)
+        cron_schedule = nil if cron_schedule && cron_schedule.empty?
 
         parent_info : Workflow::Context::ParentInfo? = nil
         if p = init.try(&.parent_workflow_info)
@@ -160,6 +167,44 @@ module Temporalio
             p.workflow_id || "",
             p.run_id || ""
           )
+        end
+
+        root_info : Workflow::Context::RootInfo? = nil
+        if r = init.try(&.root_workflow)
+          rw_id = r.workflow_id || ""
+          rr_id = r.run_id || ""
+          root_info = Workflow::Context::RootInfo.new(rw_id, rr_id) unless rw_id.empty? && rr_id.empty?
+        end
+
+        retry_policy : Client::RetryPolicy? = nil
+        if rp = init.try(&.retry_policy)
+          retry_policy = Client::RetryPolicy.new(
+            initial_interval: proto_duration_to_span(rp.initial_interval) || 1.second,
+            backoff_coefficient: rp.backoff_coefficient || 2.0,
+            maximum_interval: proto_duration_to_span(rp.maximum_interval),
+            maximum_attempts: rp.maximum_attempts || 0,
+            non_retryable_error_types: rp.non_retryable_error_types || [] of String
+          )
+        end
+
+        memo_hash = {} of String => Array(Temporal::Api::Common::V1::Payload)
+        if m = init.try(&.memo)
+          (m.fields || [] of Temporal::Api::Common::V1::MemoFieldsEntry).each do |entry|
+            k = entry.key || ""
+            next if k.empty?
+            v = entry.value
+            memo_hash[k] = [v].compact if v
+          end
+        end
+
+        sa_hash = {} of String => Array(Temporal::Api::Common::V1::Payload)
+        if sa = init.try(&.search_attributes)
+          (sa.indexed_fields || [] of Temporal::Api::Common::V1::StringPayloadEntry).each do |entry|
+            k = entry.key || ""
+            next if k.empty?
+            v = entry.value
+            sa_hash[k] = [v].compact if v
+          end
         end
 
         @context = Workflow::Context.new(
@@ -180,7 +225,17 @@ module Temporalio
           replaying: activation.is_replaying || false,
           random_seed: random_seed,
           resume_channel: @resume_ch,
-          suspended_channel: @ready_ch
+          suspended_channel: @ready_ch,
+          execution_timeout: proto_duration_to_span(init.try(&.workflow_execution_timeout)),
+          run_timeout: proto_duration_to_span(init.try(&.workflow_run_timeout)),
+          task_timeout: proto_duration_to_span(init.try(&.workflow_task_timeout)),
+          retry_policy: retry_policy,
+          cron_schedule: cron_schedule,
+          memo: memo_hash,
+          search_attributes: sa_hash,
+          root_workflow: root_info,
+          first_execution_run_id: first_execution_run_id,
+          interceptors: @interceptors
         )
 
         input_payloads = init.try(&.arguments) || [] of Temporal::Api::Common::V1::Payload
@@ -345,17 +400,31 @@ module Temporalio
         elsif signal = job.signal_workflow
           name = signal.signal_name || ""
           payloads = signal.input || [] of Temporal::Api::Common::V1::Payload
-          handled = @context.handle_signal(name, payloads)
-          unless handled
-            @workflow_object._temporal_handle_signal(name, payloads, @data_converter)
+          sig_input = Temporalio::Interceptor::HandleSignalInput.new(
+            signal_name: name,
+            args: payloads
+          )
+          run_signal_interceptors(sig_input) do |inp|
+            handled = @context.handle_signal(inp.signal_name, inp.args)
+            unless handled
+              @workflow_object._temporal_handle_signal(inp.signal_name, inp.args, @data_converter)
+            end
           end
 
         elsif query = job.query_workflow
           query_id = query.query_id || ""
           query_type = query.query_type || ""
           args = query.arguments || [] of Temporal::Api::Common::V1::Payload
-          result = @context.handle_query(query_id, query_type, args)
-          result ||= @workflow_object._temporal_handle_query(query_id, query_type, args, @data_converter)
+          query_input = Temporalio::Interceptor::HandleQueryInput.new(
+            query_id: query_id,
+            query_type: query_type,
+            args: args
+          )
+          result = run_query_interceptors(query_input) do |inp|
+            r = @context.handle_query(inp.query_id, inp.query_type, inp.args)
+            r ||= @workflow_object._temporal_handle_query(inp.query_id, inp.query_type, inp.args, @data_converter)
+            r
+          end
           @context.enqueue_command(Coresdk::WorkflowCommands::WorkflowCommand.new(
             respond_to_query: Coresdk::WorkflowCommands::QueryResult.new(
               query_id: query_id,
@@ -449,6 +518,40 @@ module Temporalio
           seconds: span.total_seconds.to_i64,
           nanos: span.nanoseconds
         )
+      end
+
+      private def proto_duration_to_span(d : Google::Protobuf::Duration?) : Time::Span?
+        return nil if d.nil?
+        secs = d.seconds || 0_i64
+        nanos = d.nanos || 0
+        return nil if secs == 0 && nanos == 0
+        Time::Span.new(seconds: secs, nanoseconds: nanos)
+      end
+
+      private def run_signal_interceptors(
+        input : Temporalio::Interceptor::HandleSignalInput,
+        &inner : Temporalio::Interceptor::HandleSignalInput -> Nil
+      ) : Nil
+        chain = @interceptors.reverse
+        fn = chain.reduce(inner) do |next_fn, interceptor|
+          Proc(Temporalio::Interceptor::HandleSignalInput, Nil).new do |i|
+            interceptor.handle_signal(i, next_fn)
+          end
+        end
+        fn.call(input)
+      end
+
+      private def run_query_interceptors(
+        input : Temporalio::Interceptor::HandleQueryInput,
+        &inner : Temporalio::Interceptor::HandleQueryInput -> Temporal::Api::Common::V1::Payload?
+      ) : Temporal::Api::Common::V1::Payload?
+        chain = @interceptors.reverse
+        fn = chain.reduce(inner) do |next_fn, interceptor|
+          Proc(Temporalio::Interceptor::HandleQueryInput, Temporal::Api::Common::V1::Payload?).new do |i|
+            interceptor.handle_query(i, next_fn)
+          end
+        end
+        fn.call(input)
       end
     end
   end

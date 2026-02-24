@@ -94,7 +94,7 @@ class ComputeActivity
     # Simulate CPU work
     result = 0_i64
     complexity.times do |i|
-      result += fibonacci(i % 20)
+      result += fibonacci((i % 20).to_i32)
     end
     
     "computed:result=#{result}"

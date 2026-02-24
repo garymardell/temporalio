@@ -2,6 +2,7 @@ require "../internal/proto"
 require "../internal/workflow_instance"
 require "../internal/failure_converter"
 require "../data_converter"
+require "../interceptor/worker_interceptor"
 
 module Temporalio
   module Internal
@@ -12,7 +13,8 @@ module Temporalio
         activation : Coresdk::WorkflowActivation::WorkflowActivation,
         data_converter : DataConverter,
         namespace : String,
-        task_queue : String
+        task_queue : String,
+        interceptors : Array(Temporalio::Interceptor::WorkerInterceptor)
       ) : WorkflowInstance
     end
 
@@ -25,16 +27,22 @@ module Temporalio
         activation : Coresdk::WorkflowActivation::WorkflowActivation,
         data_converter : DataConverter,
         namespace : String,
-        task_queue : String
+        task_queue : String,
+        interceptors : Array(Temporalio::Interceptor::WorkerInterceptor) = [] of Temporalio::Interceptor::WorkerInterceptor
       ) : WorkflowInstance
         obj = ConcreteWorkflowObject(T).new
-        WorkflowInstance.new(activation, obj, data_converter, namespace, task_queue)
+        WorkflowInstance.new(activation, obj, data_converter, namespace, task_queue, interceptors)
       end
     end
 
     # Manages the set of live WorkflowInstance objects for a worker.
     class WorkflowRunner
-      def initialize(@data_converter : DataConverter, @namespace : String, @task_queue : String)
+      def initialize(
+        @data_converter : DataConverter,
+        @namespace : String,
+        @task_queue : String,
+        @interceptors : Array(Temporalio::Interceptor::WorkerInterceptor) = [] of Temporalio::Interceptor::WorkerInterceptor
+      )
         @instances = {} of String => WorkflowInstance
         @definitions = {} of String => WorkflowDefinition
       end
@@ -85,7 +93,7 @@ module Temporalio
             return fail_completion(run_id, "Unknown workflow type: #{wf_type}")
           end
 
-          instance = defn.new_instance(activation, @data_converter, @namespace, @task_queue)
+          instance = defn.new_instance(activation, @data_converter, @namespace, @task_queue, @interceptors)
           @instances[run_id] = instance
         end
 

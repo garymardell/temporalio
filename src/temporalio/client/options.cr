@@ -150,6 +150,44 @@ module Temporalio
       end
     end
 
+    # Encapsulates the parameters for atomically starting a workflow as part of
+    # an update-with-start operation. Pass to WorkflowHandle#start_update_with_start
+    # or WorkflowHandle#execute_update_with_start.
+    class WithStartWorkflowOperation
+      getter workflow_type : String
+      getter workflow_id : String
+      getter task_queue : String
+      getter args : Array(String)
+      getter execution_timeout : Time::Span?
+      getter run_timeout : Time::Span?
+      getter task_timeout : Time::Span?
+      getter id_reuse_policy : Int32
+      getter id_conflict_policy : Int32
+      getter retry_policy : RetryPolicy?
+      getter cron_schedule : String?
+      getter memo : Hash(String, String)?
+      getter search_attributes : Hash(String, String)?
+      getter start_delay : Time::Span?
+
+      def initialize(
+        @workflow_type : String,
+        @workflow_id : String,
+        @task_queue : String,
+        @args : Array(String) = [] of String,
+        @execution_timeout : Time::Span? = nil,
+        @run_timeout : Time::Span? = nil,
+        @task_timeout : Time::Span? = nil,
+        @id_reuse_policy : Int32 = 0,
+        @id_conflict_policy : Int32 = 0,
+        @retry_policy : RetryPolicy? = nil,
+        @cron_schedule : String? = nil,
+        @memo : Hash(String, String)? = nil,
+        @search_attributes : Hash(String, String)? = nil,
+        @start_delay : Time::Span? = nil
+      )
+      end
+    end
+
     # Basic workflow execution info for list results.
     class WorkflowExecutionInfo
       getter id : String
