@@ -1,4 +1,4 @@
-class TimerWorkflow
+class UnitTimerWorkflow
   include Temporalio::Workflow
 
   workflow_name "TimerWorkflow"

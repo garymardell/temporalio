@@ -4,8 +4,11 @@ class SlowActivity
   activity_name "SlowActivity"
   
   def execute(message : String) : String
-    # Sleep for much longer than the timeout
-    sleep 10.seconds
+    # Sleep in small increments so cancellation is detected quickly when timed out
+    20.times do
+      activity.check_cancellation!
+      sleep 100.milliseconds
+    end
     "completed: #{message}"
   end
 end

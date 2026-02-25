@@ -120,6 +120,67 @@ module Temporalio
         ByteArray.new(response).to_bytes
       end
 
+      # Start an async (non-blocking) RPC call.
+      # Returns an opaque handle. Poll with rpc_poll. Free with rpc_handle_free.
+      def rpc_call_async(service : UInt32, rpc_name : String, request : Bytes) : LibTemporalioExt::AsyncRpcHandle
+        error = uninitialized LibTemporalioExt::TemporalioError
+        error.code = 0
+        error.message = LibTemporalioExt::ByteArray.new(data: Pointer(UInt8).null, len: 0)
+
+        handle = LibTemporalioExt.temporalio_client_rpc_call_async(
+          @handle,
+          service,
+          rpc_name.to_unsafe, rpc_name.bytesize,
+          request.to_unsafe, request.size,
+          pointerof(error)
+        )
+
+        if handle.null?
+          raise ExtError.from_c_error(error)
+        end
+
+        handle
+      end
+
+      # Poll an async RPC handle. Returns:
+      #   {:done, bytes}  - completed successfully
+      #   {:done, error}  - completed with error (raises)
+      #   {:pending, nil} - still in progress
+      def rpc_poll(async_handle : LibTemporalioExt::AsyncRpcHandle) : Bytes?
+        response = uninitialized LibTemporalioExt::ByteArray
+        response.data = Pointer(UInt8).null
+        response.len = 0
+
+        error = uninitialized LibTemporalioExt::TemporalioError
+        error.code = 0
+        error.message = LibTemporalioExt::ByteArray.new(data: Pointer(UInt8).null, len: 0)
+
+        result = LibTemporalioExt.temporalio_client_rpc_poll(
+          async_handle,
+          pointerof(response),
+          pointerof(error)
+        )
+
+        case result
+        when 0
+          # Done
+          if error.code != 0
+            raise ExtError.from_c_error(error)
+          end
+          ByteArray.new(response).to_bytes
+        when 1
+          # Still pending
+          nil
+        else
+          raise ExtError.from_c_error(error)
+        end
+      end
+
+      # Free an async RPC handle
+      def rpc_handle_free(async_handle : LibTemporalioExt::AsyncRpcHandle) : Nil
+        LibTemporalioExt.temporalio_client_rpc_handle_free(async_handle) unless async_handle.null?
+      end
+
       def finalize
         LibTemporalioExt.temporalio_client_free(@handle) unless @handle.null?
       end

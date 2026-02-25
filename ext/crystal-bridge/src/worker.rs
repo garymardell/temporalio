@@ -1,10 +1,9 @@
-use crossbeam_channel::{unbounded, Receiver, Sender, TryRecvError};
+use crossbeam_channel::{unbounded, Receiver, TryRecvError};
 use prost::Message;
 use std::os::raw::c_int;
 use std::slice;
 use std::sync::Arc;
 use std::thread;
-use std::time::Duration;
 use temporalio_client::ClientOptionsBuilder;
 use temporalio_common::{
     protos::coresdk::{workflow_completion::WorkflowActivationCompletion, ActivityTaskCompletion},
@@ -143,17 +142,9 @@ pub extern "C" fn temporalio_worker_new(
         }
     };
 
-    // Get the Tokio runtime for blocking
     let runtime = get_runtime();
 
-    // Create worker using init_worker - this creates both client and worker from CoreRuntime
-    eprintln!(
-        "[Rust] Creating worker: target={}, namespace={}, task_queue={}",
-        target_str, namespace_str, task_queue_str
-    );
     let worker_result = runtime.block_on(async {
-        // First connect the client
-        eprintln!("[Rust] Connecting client...");
         let client = client_opts
             .connect(
                 namespace_str,
@@ -162,12 +153,9 @@ pub extern "C" fn temporalio_worker_new(
             .await
             .map_err(|e| format!("Client connection failed: {}", e))?;
 
-        eprintln!("[Rust] Client connected, initializing worker...");
-        // Now create worker with the client
         let worker = init_worker(core_runtime, worker_config, client.into_inner())
             .map_err(|e| format!("Worker creation failed: {}", e))?;
 
-        eprintln!("[Rust] Worker created successfully");
         Ok(worker)
     });
 
@@ -179,14 +167,11 @@ pub extern "C" fn temporalio_worker_new(
             let (workflow_tx, workflow_rx) = unbounded();
             let (activity_tx, activity_rx) = unbounded();
 
-            eprintln!("[Rust] Created crossbeam channels for workflow and activity polling");
-
             // Spawn background OS thread for workflow polling
             let worker_for_workflow = worker_arc.clone();
             let workflow_tx_clone = workflow_tx.clone();
             let runtime_clone = get_runtime();
             thread::spawn(move || {
-                eprintln!("[Rust BG Thread] Starting workflow poll loop with crossbeam channel");
                 loop {
                     let result = runtime_clone
                         .block_on(async { worker_for_workflow.poll_workflow_activation().await });
@@ -195,32 +180,20 @@ pub extern "C" fn temporalio_worker_new(
                         Ok(activation) => {
                             let bytes = activation.encode_to_vec();
                             if bytes.is_empty() {
-                                eprintln!("[Rust BG Thread] Empty activation, continuing");
                                 continue;
                             }
-                            eprintln!(
-                                "[Rust BG Thread] Got workflow activation: {} bytes, sending to channel",
-                                bytes.len()
-                            );
-                            if let Err(e) =
+                            if let Err(_) =
                                 workflow_tx_clone.send(PollResult::WorkflowActivation(bytes))
                             {
-                                eprintln!(
-                                    "[Rust BG Thread] Failed to send workflow activation: {}",
-                                    e
-                                );
                                 break;
                             }
-                            eprintln!("[Rust BG Thread] Workflow activation sent to channel");
                         }
-                        Err(e) => {
-                            eprintln!("[Rust BG Thread] Workflow poll error: {}", e);
+                        Err(_) => {
                             let _ = workflow_tx_clone.send(PollResult::Shutdown);
                             break;
                         }
                     }
                 }
-                eprintln!("[Rust BG Thread] Workflow poll loop ended");
             });
 
             // Spawn background OS thread for activity polling
@@ -228,7 +201,6 @@ pub extern "C" fn temporalio_worker_new(
             let activity_tx_clone = activity_tx.clone();
             let runtime_clone2 = get_runtime();
             thread::spawn(move || {
-                eprintln!("[Rust BG Thread] Starting activity poll loop with crossbeam channel");
                 loop {
                     let result = runtime_clone2
                         .block_on(async { worker_for_activity.poll_activity_task().await });
@@ -239,24 +211,17 @@ pub extern "C" fn temporalio_worker_new(
                             if bytes.is_empty() {
                                 continue;
                             }
-                            eprintln!(
-                                "[Rust BG Thread] Got activity task: {} bytes, sending to channel",
-                                bytes.len()
-                            );
-                            if let Err(e) = activity_tx_clone.send(PollResult::ActivityTask(bytes))
+                            if let Err(_) = activity_tx_clone.send(PollResult::ActivityTask(bytes))
                             {
-                                eprintln!("[Rust BG Thread] Failed to send activity task: {}", e);
                                 break;
                             }
                         }
-                        Err(e) => {
-                            eprintln!("[Rust BG Thread] Activity poll error: {}", e);
+                        Err(_) => {
                             let _ = activity_tx_clone.send(PollResult::Shutdown);
                             break;
                         }
                     }
                 }
-                eprintln!("[Rust BG Thread] Activity poll loop ended");
             });
 
             let handle = WorkerHandle {
@@ -297,38 +262,30 @@ pub extern "C" fn temporalio_worker_poll_workflow_activation(
 
     match result {
         Ok(PollResult::WorkflowActivation(bytes)) => {
-            eprintln!(
-                "[Rust Poll] Received activation from channel, {} bytes",
-                bytes.len()
-            );
             unsafe {
                 *out_activation = ByteArray::from_vec(bytes);
             }
             0
         }
         Ok(PollResult::Shutdown) => {
-            eprintln!("[Rust Poll] Received shutdown signal");
             unsafe {
                 *out_activation = ByteArray::empty();
             }
             0
         }
         Err(TryRecvError::Empty) => {
-            // No data available - this is normal and very frequent
             unsafe {
                 *out_activation = ByteArray::empty();
             }
             0
         }
         Err(TryRecvError::Disconnected) => {
-            // Channel disconnected
             unsafe {
                 *out_activation = ByteArray::empty();
             }
             0
         }
         _ => {
-            // Wrong type (shouldn't happen)
             unsafe {
                 *out_activation = ByteArray::empty();
             }

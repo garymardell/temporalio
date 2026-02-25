@@ -1,3 +1,4 @@
+use crossbeam_channel::{unbounded, Receiver, TryRecvError};
 use prost::Message;
 use std::os::raw::c_int;
 use std::slice;
@@ -9,6 +10,15 @@ use url::Url;
 
 use crate::memory::{ByteArray, TemporalioError};
 use crate::runtime::get_runtime;
+
+/// Result type for async RPC calls
+type AsyncRpcResult = Result<Vec<u8>, String>;
+
+/// Handle for an in-flight async RPC call.
+/// Crystal polls this handle to check if the result is ready.
+pub struct AsyncRpcHandle {
+    rx: Receiver<AsyncRpcResult>,
+}
 
 /// Opaque handle for the Temporal client
 pub struct ClientHandle {
@@ -170,6 +180,119 @@ pub extern "C" fn temporalio_client_rpc_call(
                 *out_error = TemporalioError::new(-1, format!("RPC call failed: {}", e));
             }
             -1
+        }
+    }
+}
+
+/// Start an async (non-blocking) RPC call. Returns immediately with a handle.
+/// Crystal must poll the handle with temporalio_client_rpc_poll.
+/// The handle must be freed with temporalio_client_rpc_handle_free.
+#[no_mangle]
+pub extern "C" fn temporalio_client_rpc_call_async(
+    client: *mut ClientHandle,
+    service: u32,
+    rpc_name: *const u8,
+    rpc_len: usize,
+    request: *const u8,
+    request_len: usize,
+    out_error: *mut TemporalioError,
+) -> *mut AsyncRpcHandle {
+    let client_handle = unsafe {
+        match client.as_ref() {
+            Some(c) => c,
+            None => {
+                unsafe {
+                    *out_error = TemporalioError::new(-1, "Null client handle".to_string());
+                }
+                return std::ptr::null_mut();
+            }
+        }
+    };
+
+    let rpc_str = unsafe {
+        let slice = slice::from_raw_parts(rpc_name, rpc_len);
+        match std::str::from_utf8(slice) {
+            Ok(s) => s.to_string(),
+            Err(e) => {
+                unsafe {
+                    *out_error = TemporalioError::new(-1, format!("Invalid RPC name: {}", e));
+                }
+                return std::ptr::null_mut();
+            }
+        }
+    };
+
+    let request_bytes = unsafe { slice::from_raw_parts(request, request_len).to_vec() };
+
+    let runtime = get_runtime();
+    let mut client_clone = (*client_handle.client).clone();
+
+    let (tx, rx) = unbounded::<AsyncRpcResult>();
+
+    // Spawn the RPC task on the Tokio runtime without blocking the Crystal OS thread.
+    runtime.spawn(async move {
+        let result = dispatch_rpc(&mut client_clone, service, &rpc_str, &request_bytes).await;
+        let _ = tx.send(result);
+    });
+
+    let handle = AsyncRpcHandle { rx };
+    Box::into_raw(Box::new(handle))
+}
+
+/// Poll an async RPC handle for completion.
+/// Returns:
+///   0 = result available (check out_response/out_error)
+///   1 = still pending (try again later)
+///  -1 = error setting up poll
+#[no_mangle]
+pub extern "C" fn temporalio_client_rpc_poll(
+    handle: *mut AsyncRpcHandle,
+    out_response: *mut ByteArray,
+    out_error: *mut TemporalioError,
+) -> c_int {
+    let h = unsafe {
+        match handle.as_ref() {
+            Some(h) => h,
+            None => {
+                unsafe {
+                    *out_error = TemporalioError::new(-1, "Null handle".to_string());
+                }
+                return -1;
+            }
+        }
+    };
+
+    match h.rx.try_recv() {
+        Ok(Ok(response_bytes)) => {
+            unsafe {
+                *out_response = ByteArray::from_vec(response_bytes);
+            }
+            0 // done, success
+        }
+        Ok(Err(e)) => {
+            unsafe {
+                *out_error = TemporalioError::new(-1, format!("RPC call failed: {}", e));
+            }
+            0 // done, error (caller checks out_error.code)
+        }
+        Err(TryRecvError::Empty) => {
+            1 // still pending
+        }
+        Err(TryRecvError::Disconnected) => {
+            unsafe {
+                *out_error = TemporalioError::new(-1, "Async RPC channel disconnected".to_string());
+            }
+            -1
+        }
+    }
+}
+
+/// Free an async RPC handle.
+#[no_mangle]
+pub extern "C" fn temporalio_client_rpc_handle_free(handle: *mut AsyncRpcHandle) {
+    if !handle.is_null() {
+        unsafe {
+            let _ = Box::from_raw(handle);
         }
     }
 }

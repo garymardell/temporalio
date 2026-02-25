@@ -1,4 +1,4 @@
-class ContinueAsNewWorkflow
+class UnitContinueAsNewWorkflow
   include Temporalio::Workflow
 
   workflow_name "ContinueAsNewWorkflow"

@@ -4,6 +4,10 @@ require "./interceptor/worker_interceptor"
 
 class Fiber
   property temporalio_workflow_context : Temporalio::Workflow::Context?
+  # Set on update handler fibers so yield_to_poller yields to the workflow scheduler
+  # instead of directly to the poller.
+  property temporalio_update_yield_ch : Channel(Nil)?
+  property temporalio_update_wake_ch  : Channel(Nil)?
 end
 
 module Temporalio
@@ -591,6 +595,21 @@ module Temporalio
       end
     end
 
+    # Tracks a live update handler fiber executing within the workflow.
+    # Each update handler that can perform async operations runs in its own fiber,
+    # coordinated by the main workflow fiber acting as a scheduler.
+    class ActiveUpdateFiber
+      property protocol_instance_id : String
+      property fiber : Fiber?
+      property yield_ch : Channel(Nil)
+      property wake_ch  : Channel(Nil)
+      property started  : Bool = false
+      property done     : Bool = false
+
+      def initialize(@protocol_instance_id, @yield_ch, @wake_ch)
+      end
+    end
+
     # The workflow context, available inside workflow code via Workflow::Context.current.
     class Context
       # Returns the current workflow context (must be called from within a workflow fiber).
@@ -708,6 +727,12 @@ module Temporalio
       # Pending updates waiting for handler execution.
       @pending_updates : Hash(String, PendingUpdate)
 
+      # Active update handler fibers (update handlers in progress, may span activations).
+      @active_update_fibers : Array(ActiveUpdateFiber)
+
+      # Reference to the workflow object (set after construction by WorkflowInstance).
+      @workflow_object : Internal::WorkflowObject?
+
       # Worker-side interceptors for outbound workflow operations.
       @interceptors : Array(Interceptor::WorkerInterceptor)
 
@@ -750,7 +775,7 @@ module Temporalio
         @first_execution_run_id : String? = nil,
         @interceptors : Array(Interceptor::WorkerInterceptor) = [] of Interceptor::WorkerInterceptor
       )
-        @random = Random.new(random_seed.to_i64)
+        @random = Random.new(random_seed)
         @commands = [] of Coresdk::WorkflowCommands::WorkflowCommand
         @pending_timers = {} of UInt32 => Channel(Nil)
         @pending_activities = {} of UInt32 => Channel(Coresdk::ActivityResult::ActivityResolution)
@@ -763,6 +788,13 @@ module Temporalio
         @signal_handlers = {} of String => Proc(Array(Temporal::Api::Common::V1::Payload), Nil)
         @query_handlers = {} of String => Proc(Array(Temporal::Api::Common::V1::Payload), Temporal::Api::Common::V1::Payload?)
         @pending_updates = {} of String => PendingUpdate
+        @active_update_fibers = [] of ActiveUpdateFiber
+        @workflow_object = nil
+      end
+
+      # Set the workflow object reference (called by WorkflowInstance after construction).
+      def workflow_object=(obj : Internal::WorkflowObject) : Nil
+        @workflow_object = obj
       end
 
       # Register a signal handler on this context instance.
@@ -798,7 +830,7 @@ module Temporalio
 
       # Reseed the deterministic RNG (called when an UpdateRandomSeed job arrives).
       def update_random_seed(seed : UInt64) : Nil
-        @random = Random.new(seed.to_i64)
+        @random = Random.new(seed)
       end
 
       # Collect and clear accumulated commands for the current activation.
@@ -855,61 +887,109 @@ module Temporalio
         )
       end
 
-      # Execute queued update handlers.
-      # Called when workflow fiber resumes after DoUpdate jobs are applied.
-      # This method is called from WorkflowInstance after fiber processes other jobs.
-      def execute_queued_update_handlers(
-        workflow_object : Internal::WorkflowObject,
-        data_converter : DataConverter
-      ) : Nil
-        @pending_updates.each do |protocol_instance_id, update|
-          begin
-            # Thread through handle_update interceptors
-            update_input = Interceptor::HandleUpdateInput.new(
-              update_id: protocol_instance_id,
-              update_name: update.name,
-              args: update.input
-            )
-            chain = @interceptors.reverse
-            inner_fn = Proc(Interceptor::HandleUpdateInput, Temporal::Api::Common::V1::Payload?).new do |inp|
-              workflow_object._temporal_handle_update(
-                inp.update_name,
-                inp.args,
-                data_converter
-              )
-            end
-            update_fn = chain.reduce(inner_fn) do |next_fn, interceptor|
-              Proc(Interceptor::HandleUpdateInput, Temporal::Api::Common::V1::Payload?).new do |i|
-                interceptor.handle_update(i, next_fn)
-              end
-            end
-            # Execute handler (can yield, use workflow operations)
-            result = update_fn.call(update_input)
+      # Spawn fibers for any newly-queued pending updates.
+      # Called from within the main workflow fiber (via yield_to_poller).
+      # Each update handler runs in its own fiber with the workflow context installed,
+      # so it can call workflow operations (sleep, execute_activity, etc.).
+      private def spawn_pending_update_fibers : Nil
+        return if @pending_updates.empty?
 
-            # Send Completed response
-            enqueue_command(
-              Coresdk::WorkflowCommands::WorkflowCommand.new(
-                update_response: Coresdk::WorkflowCommands::UpdateResponse.new(
-                  protocol_instance_id: protocol_instance_id,
-                  completed: result
+        already_active = @active_update_fibers.map(&.protocol_instance_id).to_set
+
+        # Collect updates to process (avoid mutating hash during iteration)
+        updates_to_spawn = @pending_updates.values.reject { |u| already_active.includes?(u.protocol_instance_id) }
+        updates_to_spawn.each do |update|
+          @pending_updates.delete(update.protocol_instance_id)
+        end
+
+        updates_to_spawn.each do |update|
+          pid = update.protocol_instance_id
+
+          yield_ch = Channel(Nil).new(1)
+          wake_ch  = Channel(Nil).new(1)
+
+          af = ActiveUpdateFiber.new(pid, yield_ch, wake_ch)
+          @active_update_fibers << af
+
+          ctx = self
+          dc = @data_converter
+          wf_obj = @workflow_object.not_nil!
+          update_name = update.name
+          input = update.input
+          interceptors = @interceptors
+
+          f = Fiber.new do
+            Fiber.current.temporalio_workflow_context = ctx
+            Fiber.current.temporalio_update_yield_ch  = yield_ch
+            Fiber.current.temporalio_update_wake_ch   = wake_ch
+
+            begin
+              update_input = Interceptor::HandleUpdateInput.new(
+                update_id: pid,
+                update_name: update_name,
+                args: input
+              )
+              chain = interceptors.reverse
+              inner_fn = Proc(Interceptor::HandleUpdateInput, Temporal::Api::Common::V1::Payload?).new do |inp|
+                wf_obj._temporal_handle_update(inp.update_name, inp.args, dc)
+              end
+              update_fn = chain.reduce(inner_fn) do |next_fn, interceptor|
+                Proc(Interceptor::HandleUpdateInput, Temporal::Api::Common::V1::Payload?).new do |i|
+                  interceptor.handle_update(i, next_fn)
+                end
+              end
+              result = update_fn.call(update_input)
+
+              ctx.enqueue_command(
+                Coresdk::WorkflowCommands::WorkflowCommand.new(
+                  update_response: Coresdk::WorkflowCommands::UpdateResponse.new(
+                    protocol_instance_id: pid,
+                    completed: result
+                  )
                 )
               )
-            )
-          rescue ex
-            # Send Rejected response
-            failure = Internal::FailureConverter.to_failure(ex, data_converter)
-            enqueue_command(
-              Coresdk::WorkflowCommands::WorkflowCommand.new(
-                update_response: Coresdk::WorkflowCommands::UpdateResponse.new(
-                  protocol_instance_id: protocol_instance_id,
-                  rejected: failure
+            rescue ex
+              failure = Internal::FailureConverter.to_failure(ex, dc)
+              ctx.enqueue_command(
+                Coresdk::WorkflowCommands::WorkflowCommand.new(
+                  update_response: Coresdk::WorkflowCommands::UpdateResponse.new(
+                    protocol_instance_id: pid,
+                    rejected: failure
+                  )
                 )
               )
-            )
+            ensure
+              Fiber.current.temporalio_workflow_context = nil
+              Fiber.current.temporalio_update_yield_ch  = nil
+              Fiber.current.temporalio_update_wake_ch   = nil
+            end
+
+            af.done = true
+            yield_ch.send(nil)  # signal scheduler that we're done
           end
 
-          @pending_updates.delete(protocol_instance_id)
+          af.fiber = f
         end
+      end
+
+      # Drive all active update handler fibers forward one step.
+      # Each fiber runs until it calls yield_to_poller (which signals yield_ch) or finishes.
+      # Called from within the main workflow fiber.
+      private def drive_active_update_fibers : Nil
+        @active_update_fibers.reject!(&.done)
+        return if @active_update_fibers.empty?
+
+        @active_update_fibers.each do |af|
+          if af.started
+            af.wake_ch.send(nil)          # resume a paused update fiber
+          else
+            af.started = true
+            af.fiber.not_nil!.enqueue     # start the fiber for the first time
+          end
+          af.yield_ch.receive             # wait for it to yield or finish
+        end
+
+        @active_update_fibers.reject!(&.done)
       end
 
       # Mark the workflow as cancelled (called when CancelWorkflow job arrives).
@@ -1401,6 +1481,11 @@ module Temporalio
       end
 
       private def do_sleep(duration : Time::Span) : Nil
+        # Check for immediate cancellation before scheduling the timer.
+        # This handles the case where cancel_workflow is delivered in the
+        # same activation as initialize_workflow (cancel before first yield).
+        check_cancellation!
+
         seq = alloc_seq
         timer_ch = Channel(Nil).new(1)
         @pending_timers[seq] = timer_ch
@@ -1416,16 +1501,26 @@ module Temporalio
         yield_to_poller
 
         # Wait for timer to fire, checking cancellation on each activation
-        until timer_fired
-          check_cancellation!
+        begin
+          until timer_fired
+            check_cancellation!
 
-          # Check if timer has fired (non-blocking)
-          select
-          when timer_ch.receive
-            timer_fired = true
-          else
-            # Timer not ready yet, yield to next activation
-            yield_to_poller
+            # Check if timer has fired (non-blocking)
+            select
+            when timer_ch.receive
+              timer_fired = true
+            else
+              # Timer not ready yet, yield to next activation
+              yield_to_poller
+            end
+          end
+        ensure
+          # If the timer didn't fire (e.g. due to cancellation), cancel it
+          unless timer_fired
+            @pending_timers.delete(seq)
+            @commands << Coresdk::WorkflowCommands::WorkflowCommand.new(
+              cancel_timer: Coresdk::WorkflowCommands::CancelTimer.new(seq: seq)
+            )
           end
         end
       end
@@ -1520,9 +1615,27 @@ module Temporalio
       end
 
       # Yield control back to the poller fiber.
+      #
+      # If called from within an update handler fiber, this yields to the workflow
+      # scheduler (the main workflow fiber) instead of directly to the poller.
+      # The workflow fiber then batches all update fiber yields before signaling
+      # the poller, ensuring commands from all fibers are collected together.
       def yield_to_poller : Nil
-        @suspended_channel.send(nil)
-        @resume_channel.receive
+        if update_yield_ch = Fiber.current.temporalio_update_yield_ch
+          # We're inside an update handler fiber. Yield to the workflow scheduler.
+          wake_ch = Fiber.current.temporalio_update_wake_ch.not_nil!
+          update_yield_ch.send(nil)
+          wake_ch.receive
+        else
+          # We're in the main workflow fiber. Drive update fibers, then yield to poller.
+          spawn_pending_update_fibers
+          drive_active_update_fibers
+          @suspended_channel.send(nil)
+          @resume_channel.receive
+          # Poller just resumed us. Drive update fibers again before returning to user code.
+          spawn_pending_update_fibers
+          drive_active_update_fibers
+        end
       end
 
       # Resume the workflow fiber from the poller side.

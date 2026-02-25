@@ -58,7 +58,7 @@ module Temporalio
           )
           chain = @interceptors.reverse
           inner_fn = Proc(Temporalio::Interceptor::ExecuteActivityInput, Temporal::Api::Common::V1::Payload?).new do |inp|
-            activity_class.execute_activity(inp.args, @data_converter)
+            activity_class.execute_activity(inp.args, @data_converter).as(Temporal::Api::Common::V1::Payload?)
           end
           fn = chain.reduce(inner_fn) do |next_fn, interceptor|
             Proc(Temporalio::Interceptor::ExecuteActivityInput, Temporal::Api::Common::V1::Payload?).new do |i|

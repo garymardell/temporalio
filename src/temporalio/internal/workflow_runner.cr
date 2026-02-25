@@ -54,28 +54,9 @@ module Temporalio
 
       # Process a raw activation bytes from Core. Returns completion bytes to send back.
       def handle_activation(bytes : Bytes) : Bytes
+        run_id = ""
         activation = Coresdk::WorkflowActivation::WorkflowActivation.from_protobuf(IO::Memory.new(bytes))
         run_id = activation.run_id || ""
-        jobs = activation.jobs || [] of Coresdk::WorkflowActivation::WorkflowActivationJob
-        jobs.each_with_index do |job, i|
-          job_type = case
-          when job.initialize_workflow then "InitializeWorkflow"
-          when job.fire_timer then "FireTimer"
-          when job.update_random_seed then "UpdateRandomSeed"
-          when job.query_workflow then "QueryWorkflow"
-          when job.cancel_workflow then "CancelWorkflow"
-          when job.signal_workflow then "SignalWorkflow"
-          when job.resolve_activity then "ResolveActivity"
-          when job.resolve_child_workflow_execution then "ResolveChildWorkflowExecution"
-          when job.do_update then "DoUpdate"
-          when job.remove_from_cache then "RemoveFromCache"
-          when job.notify_has_patch then "NotifyHasPatch"
-          when job.resolve_child_workflow_execution_start then "ResolveChildWorkflowExecutionStart"
-          when job.resolve_signal_external_workflow then "ResolveSignalExternalWorkflow"
-          when job.resolve_request_cancel_external_workflow then "ResolveRequestCancelExternalWorkflow"
-          else "Unknown"
-          end
-        end
 
         instance = @instances[run_id]?
 
@@ -99,11 +80,39 @@ module Temporalio
 
         completion = instance.apply_activation(activation)
 
+        if compl_ok = completion.successful
+          job_descs = (activation.jobs || [] of Coresdk::WorkflowActivation::WorkflowActivationJob).map { |j|
+            desc = if j.initialize_workflow; "init_workflow"
+            elsif j.do_update; "do_update(#{j.do_update.not_nil!.name})"
+            elsif j.fire_timer; "fire_timer(#{j.fire_timer.not_nil!.seq})"
+            elsif j.remove_from_cache; "remove_from_cache"
+            else; "other"
+            end
+            desc
+          }
+          cmd_descs = (compl_ok.commands || [] of Coresdk::WorkflowCommands::WorkflowCommand).map { |c|
+            desc = if c.start_timer; "start_timer(#{c.start_timer.not_nil!.seq})"
+            elsif c.update_response
+              ur = c.update_response.not_nil!
+              if ur.accepted; "update_accepted"
+              elsif ur.completed; "update_completed"
+              elsif ur.rejected; "update_rejected"
+              else; "update_?"
+              end
+            elsif c.complete_workflow_execution; "complete_workflow"
+            elsif c.fail_workflow_execution; "fail_workflow"
+            elsif c.cancel_timer; "cancel_timer"
+            else; "other_cmd"
+            end
+            desc
+          }
+        end
+
         @instances.delete(run_id) if instance.complete?
 
         completion.to_protobuf.to_slice
       rescue ex
-        fail_completion("", ex.message || ex.class.name)
+        fail_completion(run_id || "", ex.message || ex.class.name)
       end
 
       def cached_size : Int32

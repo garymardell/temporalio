@@ -79,7 +79,37 @@ module Temporalio
       # Make an RPC call to the Temporal server.
       # Service codes: 1 = Workflow, 2 = Operator, 3 = Cloud, 4 = Test, 5 = Health
       def rpc_call(service : Symbol | UInt32, rpc : String, request : Bytes) : Bytes
-        service_code = case service
+        service_code = resolve_service_code(service)
+        @client.rpc_call(service_code, rpc, request)
+      end
+
+      # Start an async (non-blocking) RPC call. Returns immediately.
+      # Returns a raw async handle pointer. Poll with rpc_poll_async. Free with rpc_free_async.
+      def rpc_call_async(service : Symbol | UInt32, rpc : String, request : Bytes) : LibTemporalioExt::AsyncRpcHandle
+        service_code = resolve_service_code(service)
+        @client.rpc_call_async(service_code, rpc, request)
+      end
+
+      # Poll an async RPC handle. Returns response bytes when done, nil if still pending.
+      # Raises on error.
+      def rpc_poll_async(handle : LibTemporalioExt::AsyncRpcHandle) : Bytes?
+        @client.rpc_poll(handle)
+      end
+
+      # Free an async RPC handle.
+      def rpc_free_async(handle : LibTemporalioExt::AsyncRpcHandle) : Nil
+        @client.rpc_handle_free(handle)
+      end
+
+      # Close the client connection
+      # Required by DB::Pool interface
+      def close
+        # The Rust extension manages its own cleanup
+        # This is a no-op for compatibility with connection pooling
+      end
+
+      private def resolve_service_code(service : Symbol | UInt32) : UInt32
+        case service
         when Symbol
           case service
           when :workflow then 1_u32
@@ -94,15 +124,6 @@ module Temporalio
         else
           raise "Invalid service type: #{service.class}"
         end
-
-        @client.rpc_call(service_code, rpc, request)
-      end
-      
-      # Close the client connection
-      # Required by DB::Pool interface
-      def close
-        # The Rust extension manages its own cleanup
-        # This is a no-op for compatibility with connection pooling
       end
     end
 

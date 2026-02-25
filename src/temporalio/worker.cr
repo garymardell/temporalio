@@ -57,7 +57,7 @@ module Temporalio
       if bridge_client.nil?
         raise ArgumentError.new("Worker requires a non-pooled client. Use Client.connect() instead of Client.connect_with_pool()")
       end
-      
+
       runtime = bridge_client.runtime
       bridge_opts = Bridge::WorkerOptions.new(
         task_queue: @task_queue,
@@ -73,7 +73,7 @@ module Temporalio
       workflows.each { |d| @workflow_runner.register(d) }
       @has_workflows = !workflows.empty?
       @has_activities = !activities.empty?
-      
+
       @workflow_poller_done = Channel(Nil).new(1)
       @activity_poller_done = Channel(Nil).new(1)
       @pollers_started = false
@@ -127,7 +127,7 @@ module Temporalio
         # Don't wait on channels - they cause crashes
         # Just sleep briefly to let fibers finish
         sleep 500.milliseconds
-        
+
         # Now safe to finalize
         # @bridge_worker.finalize_shutdown
       end
@@ -138,7 +138,7 @@ module Temporalio
       # Wait for pollers to exit
       @workflow_poller_done.receive if @has_workflows
       @activity_poller_done.receive if @has_activities
-      
+
       # Now safe to finalize
       @bridge_worker.finalize_shutdown
     end
@@ -148,7 +148,7 @@ module Temporalio
         begin
           loop do
             bytes = @bridge_worker.poll_workflow_activation rescue nil
-            
+
             # nil or empty bytes means no data available yet
             if bytes.nil? || bytes.empty?
               # Sleep briefly to avoid tight loop
@@ -157,6 +157,8 @@ module Temporalio
             end
 
             # Process activation synchronously in the poller fiber
+            # Yield to allow other fibers (e.g. client polling) to run before processing
+            Fiber.yield
             begin
               completion_bytes = @workflow_runner.handle_activation(bytes)
               @bridge_worker.complete_workflow_activation(completion_bytes)
@@ -175,7 +177,7 @@ module Temporalio
         begin
           loop do
             bytes = @bridge_worker.poll_activity_task rescue nil
-            
+
             # nil or empty bytes means no data available yet
             if bytes.nil? || bytes.empty?
               sleep 10.milliseconds

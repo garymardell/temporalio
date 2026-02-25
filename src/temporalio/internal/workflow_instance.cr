@@ -237,6 +237,9 @@ module Temporalio
           first_execution_run_id: first_execution_run_id,
           interceptors: @interceptors
         )
+        # Give the context a reference to the workflow object so it can spawn
+        # update handler fibers from within the workflow fiber.
+        @context.workflow_object = @workflow_object
 
         input_payloads = init.try(&.arguments) || [] of Temporal::Api::Common::V1::Payload
 
@@ -280,12 +283,10 @@ module Temporalio
         jobs = activation.jobs || [] of Coresdk::WorkflowActivation::WorkflowActivationJob
 
         if jobs.any?(&.remove_from_cache)
-          # Only mark complete if there are no pending activities/timers/child workflows
-          # Otherwise, keep the instance alive to process future activations
-          if !@context.has_pending_work?
-            @complete = true
-          else
+          rfc_job = jobs.find(&.remove_from_cache)
+          if rfc_job && (rfc = rfc_job.remove_from_cache)
           end
+          @complete = true
           return activation_completion(run_id, [] of Coresdk::WorkflowCommands::WorkflowCommand)
         end
 
@@ -306,9 +307,6 @@ module Temporalio
         if fiber_jobs.empty? && @workflow_fiber_started
           return activation_completion(run_id, @context.drain_commands)
         end
-
-        # Execute any queued update handlers before resuming the fiber
-        @context.execute_queued_update_handlers(@workflow_object, @data_converter)
 
         if !@workflow_fiber_started
           @workflow_fiber_started = true
@@ -334,8 +332,7 @@ module Temporalio
 
         if rt = result_tuple
           result_payload, error = rt
-          # DON'T set @complete here - wait for remove_from_cache job
-          # @complete = true
+          @complete = true
 
           cmds = @context.drain_commands
           if err = error
@@ -368,14 +365,7 @@ module Temporalio
           return activation_completion(run_id, cmds)
         end
 
-        cmds = @context.drain_commands
-        cmds.each_with_index do |cmd, i|
-          if cmd.schedule_activity
-          elsif cmd.start_timer
-          else
-          end
-        end
-        activation_completion(run_id, cmds)
+        activation_completion(run_id, @context.drain_commands)
       end
 
       private def apply_job(job : Coresdk::WorkflowActivation::WorkflowActivationJob) : Nil
@@ -457,7 +447,13 @@ module Temporalio
         update_name = update.name || ""
         input = update.input || [] of Temporal::Api::Common::V1::Payload
 
-        # Phase 1: Validation (synchronous, in poller fiber)
+        # Phase 1: Validation (synchronous, in poller fiber).
+        # run_validator controls whether to run the validator code, but does NOT control
+        # whether to send the `accepted` command. Per the Core SDK proto:
+        #   "Must be sent if the update's validator has passed (or lang was not asked to
+        #    run it, and thus should be considered already-accepted, allowing lang to
+        #    always send the same sequence on replay)."
+        # So `accepted` must always be sent on success (whether or not validator ran).
         if update.run_validator
           begin
             # Run validator - no fiber yielding allowed
@@ -465,16 +461,6 @@ module Temporalio
               update_name,
               input,
               @data_converter
-            )
-
-            # Validator passed - send Accepted response
-            @context.enqueue_command(
-              Coresdk::WorkflowCommands::WorkflowCommand.new(
-                update_response: Coresdk::WorkflowCommands::UpdateResponse.new(
-                  protocol_instance_id: protocol_instance_id,
-                  accepted: Google::Protobuf::Empty.new
-                )
-              )
             )
           rescue ex
             # Validator failed - send Rejected response, done
@@ -490,6 +476,16 @@ module Temporalio
             return  # Don't run handler
           end
         end
+
+        # Always send Accepted response (validator passed or was not asked to run).
+        @context.enqueue_command(
+          Coresdk::WorkflowCommands::WorkflowCommand.new(
+            update_response: Coresdk::WorkflowCommands::UpdateResponse.new(
+              protocol_instance_id: protocol_instance_id,
+              accepted: Google::Protobuf::Empty.new
+            )
+          )
+        )
 
         # Phase 2: Queue handler for async execution
         @context.queue_update_handler(protocol_instance_id, update_name, input)

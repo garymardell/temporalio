@@ -33,7 +33,10 @@ module Temporalio
 
           history = response.history
           events = history.try(&.events)
-          raise Error.new("No history events returned") if events.nil? || events.empty?
+          if events.nil? || events.empty?
+            sleep 500.milliseconds
+            next
+          end
 
           events.each do |event|
             # WORKAROUND: The event_type field is unreliable in the partial proto binding.
@@ -126,8 +129,8 @@ module Temporalio
 
           next if response.next_page_token.try(&.empty?) == false
           
-          # Workflow not yet complete, sleep briefly to allow other fibers (like worker) to run
-          sleep 100.milliseconds
+          # Workflow not yet complete, sleep to allow other fibers (like worker) to run
+          sleep 500.milliseconds
         end
       end
 
@@ -236,38 +239,46 @@ module Temporalio
           )
         )
 
-        # Send RPC
-        resp_bytes = @client.workflow_service_call("UpdateWorkflowExecution", req.to_protobuf.to_slice)
-        resp = Temporal::Api::Workflowservice::V1::UpdateWorkflowExecutionResponse.from_protobuf(IO::Memory.new(resp_bytes))
-        
-        # If accepted but not yet completed, poll for completion
-        # Note: This polling approach works with full Temporal Server but may have
-        # limitations with temporal server start-dev
-        if resp.outcome.nil?
-          # Give worker time to process the update
-          sleep 0.5.seconds
-          
-          # Now poll for the completed result
-          10.times do
-            update_handle = UpdateHandle.new(@client, @workflow_id, @run_id, update_id)
-            result = update_handle.result rescue nil
-            return result if result
-            sleep 0.2.seconds
+        # Send the UpdateWorkflowExecution RPC asynchronously (non-blocking).
+        # This is critical: the UpdateWorkflowExecution RPC with lifecycle_stage=ACCEPTED is a
+        # long-polling call that blocks until the workflow worker accepts the update.
+        # In Crystal's single-threaded fiber model, a blocking call would prevent the worker
+        # fiber from running, causing a deadlock. By using the async interface, we yield
+        # control back to the scheduler between polls so the worker fiber can process the WFT.
+        async_handle = @client.workflow_service_call_async("UpdateWorkflowExecution", req.to_protobuf.to_slice)
+        resp_bytes = Bytes.empty
+        begin
+          loop do
+            result = @client.workflow_service_call_poll(async_handle)
+            if result
+              resp_bytes = result
+              break
+            end
+            # Yield to allow worker fiber to run (process pending WFTs)
+            sleep 10.milliseconds
           end
-          return nil
+        ensure
+          @client.workflow_service_call_free(async_handle)
         end
-        
-        # Extract outcome
+
+        resp = Temporal::Api::Workflowservice::V1::UpdateWorkflowExecutionResponse.from_protobuf(IO::Memory.new(resp_bytes))
+
+        # Check if already completed in the response
         if outcome = resp.outcome
           if success = outcome.success
-            # Return result as JSON string
             values = @client.data_converter.from_payloads_message(success)
             return values.first? if values.any?
           elsif failure = outcome.failure
-            # Convert failure to exception and raise
-            ex = Internal::FailureConverter.from_failure(failure, @client.data_converter)
-            raise ex
+            raise Internal::FailureConverter.from_failure(failure, @client.data_converter)
           end
+        end
+
+        # Poll for the result. Give the worker fiber time to run between polls.
+        update_handle = UpdateHandle.new(@client, @workflow_id, @run_id, update_id)
+        60.times do
+          sleep 0.5.seconds
+          result = update_handle.poll_result
+          return result if result
         end
 
         nil
@@ -281,7 +292,6 @@ module Temporalio
         # Convert args to payloads
         input_payloads = args.to_a.map { |a| @client.data_converter.to_payload(a).as(Temporal::Api::Common::V1::Payload) }
 
-        # Build request (wait for ACCEPTED, not COMPLETED)
         req = Temporal::Api::Workflowservice::V1::UpdateWorkflowExecutionRequest.new(
           namespace: @client.namespace,
           workflow_execution: Temporal::Api::Common::V1::WorkflowExecution.new(
@@ -300,13 +310,23 @@ module Temporalio
             )
           ),
           wait_policy: Temporal::Api::Update::V1::WaitPolicy.new(
-            lifecycle_stage: 2  # ACCEPTED
+            lifecycle_stage: 2  # ACCEPTED - wait for validator to pass
           )
         )
 
-        # Send RPC
-        resp_bytes = @client.workflow_service_call("UpdateWorkflowExecution", req.to_protobuf.to_slice)
-        resp = Temporal::Api::Workflowservice::V1::UpdateWorkflowExecutionResponse.from_protobuf(IO::Memory.new(resp_bytes))
+        # Send async to avoid deadlock: UpdateWorkflowExecution blocks until the worker accepts
+        # the update, but the worker needs the Crystal OS thread to process WFTs.
+        async_handle = @client.workflow_service_call_async("UpdateWorkflowExecution", req.to_protobuf.to_slice)
+        begin
+          loop do
+            result = @client.workflow_service_call_poll(async_handle)
+            break if result
+            # Yield to allow worker fiber to run (process pending WFTs)
+            sleep 10.milliseconds
+          end
+        ensure
+          @client.workflow_service_call_free(async_handle)
+        end
 
         # Return UpdateHandle for async tracking
         UpdateHandle.new(@client, @workflow_id, @run_id, update_id)

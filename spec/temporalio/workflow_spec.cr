@@ -93,7 +93,7 @@ describe "Temporalio Workflow Engine" do
     it "emits StartTimer command and suspends" do
       run_id = "run-#{Random.new.hex(8)}"
       act = init_activation(run_id, "TimerWorkflow", [dc.to_payload(5_i64)])
-      wf = Temporalio::Internal::ConcreteWorkflowObject(TimerWorkflow).new
+      wf = Temporalio::Internal::ConcreteWorkflowObject(UnitTimerWorkflow).new
       inst = Temporalio::Internal::WorkflowInstance.new(act, wf, dc, "default", "test-queue")
       comp = inst.apply_activation(act)
 
@@ -109,7 +109,7 @@ describe "Temporalio Workflow Engine" do
     it "completes after FireTimer job" do
       run_id = "run-#{Random.new.hex(8)}"
       act = init_activation(run_id, "TimerWorkflow", [dc.to_payload(3_i64)])
-      wf = Temporalio::Internal::ConcreteWorkflowObject(TimerWorkflow).new
+      wf = Temporalio::Internal::ConcreteWorkflowObject(UnitTimerWorkflow).new
       inst = Temporalio::Internal::WorkflowInstance.new(act, wf, dc, "default", "test-queue")
       comp1 = inst.apply_activation(act)
 
@@ -163,7 +163,7 @@ describe "Temporalio Workflow Engine" do
       run_id = "run-#{Random.new.hex(8)}"
       t0 = 1_700_000_000_i64
       act = init_activation(run_id, "TimerWorkflow", [dc.to_payload(1_i64)], timestamp_secs: t0)
-      wf = Temporalio::Internal::ConcreteWorkflowObject(TimerWorkflow).new
+      wf = Temporalio::Internal::ConcreteWorkflowObject(UnitTimerWorkflow).new
       inst = Temporalio::Internal::WorkflowInstance.new(act, wf, dc, "default", "test-queue")
       inst.apply_activation(act)
 
@@ -580,7 +580,7 @@ describe "Temporalio Workflow Engine" do
     it "CancelWorkflow job sets cancelled flag and check_cancellation! raises" do
       run_id = "run-#{Random.new.hex(8)}"
       act = init_activation(run_id, "CancellationWorkflow")
-      wf = Temporalio::Internal::ConcreteWorkflowObject(CancellationWorkflow).new
+      wf = Temporalio::Internal::ConcreteWorkflowObject(UnitCancellationWorkflow).new
       inst = Temporalio::Internal::WorkflowInstance.new(act, wf, dc, "default", "test-queue")
       comp1 = inst.apply_activation(act)
 
@@ -755,7 +755,7 @@ describe "Temporalio Workflow Engine" do
     it "emits ContinueAsNewWorkflowExecution command" do
       run_id = "run-#{Random.new.hex(8)}"
       act = init_activation(run_id, "ContinueAsNewWorkflow", [dc.to_payload(3_i64)])
-      wf = Temporalio::Internal::ConcreteWorkflowObject(ContinueAsNewWorkflow).new
+      wf = Temporalio::Internal::ConcreteWorkflowObject(UnitContinueAsNewWorkflow).new
       inst = Temporalio::Internal::WorkflowInstance.new(act, wf, dc, "default", "test-queue")
       comp = inst.apply_activation(act)
 
@@ -767,7 +767,7 @@ describe "Temporalio Workflow Engine" do
     it "ContinueAsNew passes encoded args" do
       run_id = "run-#{Random.new.hex(8)}"
       act = init_activation(run_id, "ContinueAsNewWorkflow", [dc.to_payload(5_i64)])
-      wf = Temporalio::Internal::ConcreteWorkflowObject(ContinueAsNewWorkflow).new
+      wf = Temporalio::Internal::ConcreteWorkflowObject(UnitContinueAsNewWorkflow).new
       inst = Temporalio::Internal::WorkflowInstance.new(act, wf, dc, "default", "test-queue")
       comp = inst.apply_activation(act)
 
@@ -780,7 +780,7 @@ describe "Temporalio Workflow Engine" do
     it "workflow terminates immediately when count reaches 0" do
       run_id = "run-#{Random.new.hex(8)}"
       act = init_activation(run_id, "ContinueAsNewWorkflow", [dc.to_payload(0_i64)])
-      wf = Temporalio::Internal::ConcreteWorkflowObject(ContinueAsNewWorkflow).new
+      wf = Temporalio::Internal::ConcreteWorkflowObject(UnitContinueAsNewWorkflow).new
       inst = Temporalio::Internal::WorkflowInstance.new(act, wf, dc, "default", "test-queue")
       comp = inst.apply_activation(act)
 
@@ -909,7 +909,7 @@ describe "Temporalio Workflow Engine" do
 
     it "caches in-progress workflows across multiple activations" do
       runner = Temporalio::Internal::WorkflowRunner.new(dc, "default", "test-queue")
-      runner.register(Temporalio::Internal::ConcreteWorkflowDefinition(TimerWorkflow).new)
+      runner.register(Temporalio::Internal::ConcreteWorkflowDefinition(UnitTimerWorkflow).new)
 
       run_id = "run-#{Random.new.hex(8)}"
       act1 = init_activation(run_id, "TimerWorkflow", [dc.to_payload(1_i64)])
@@ -944,7 +944,7 @@ describe "Temporalio Workflow Engine" do
 
     it "removes workflow from cache on remove_from_cache job" do
       runner = Temporalio::Internal::WorkflowRunner.new(dc, "default", "test-queue")
-      runner.register(Temporalio::Internal::ConcreteWorkflowDefinition(TimerWorkflow).new)
+      runner.register(Temporalio::Internal::ConcreteWorkflowDefinition(UnitTimerWorkflow).new)
 
       run_id = "run-#{Random.new.hex(8)}"
       act1 = init_activation(run_id, "TimerWorkflow", [dc.to_payload(1_i64)])
@@ -1025,7 +1025,7 @@ describe "Workflow determinism" do
     # Capture commands from first run
     run_id_1 = "det-run-A"
     act1 = init_activation(run_id_1, "TimerWorkflow", [dc.to_payload(2_i64)])
-    wf1 = Temporalio::Internal::ConcreteWorkflowObject(TimerWorkflow).new
+    wf1 = Temporalio::Internal::ConcreteWorkflowObject(UnitTimerWorkflow).new
     inst1 = Temporalio::Internal::WorkflowInstance.new(act1, wf1, dc, "default", "test-queue")
     comp1a = inst1.apply_activation(act1)
     seq1 = comp1a.successful.not_nil!.commands.not_nil![0].start_timer.not_nil!.seq
@@ -1044,7 +1044,7 @@ describe "Workflow determinism" do
     # Second run — same sequence
     run_id_2 = "det-run-B"
     act2 = init_activation(run_id_2, "TimerWorkflow", [dc.to_payload(2_i64)])
-    wf2 = Temporalio::Internal::ConcreteWorkflowObject(TimerWorkflow).new
+    wf2 = Temporalio::Internal::ConcreteWorkflowObject(UnitTimerWorkflow).new
     inst2 = Temporalio::Internal::WorkflowInstance.new(act2, wf2, dc, "default", "test-queue")
     comp2a = inst2.apply_activation(act2)
     seq2 = comp2a.successful.not_nil!.commands.not_nil![0].start_timer.not_nil!.seq
@@ -1073,8 +1073,8 @@ describe "Workflow determinism" do
     act_a = init_activation(run_a, "TimerWorkflow", [dc.to_payload(1_i64)])
     act_b = init_activation(run_b, "TimerWorkflow", [dc.to_payload(1_i64)])
 
-    wf_a = Temporalio::Internal::ConcreteWorkflowObject(TimerWorkflow).new
-    wf_b = Temporalio::Internal::ConcreteWorkflowObject(TimerWorkflow).new
+    wf_a = Temporalio::Internal::ConcreteWorkflowObject(UnitTimerWorkflow).new
+    wf_b = Temporalio::Internal::ConcreteWorkflowObject(UnitTimerWorkflow).new
 
     inst_a = Temporalio::Internal::WorkflowInstance.new(act_a, wf_a, dc, "default", "test-queue")
     inst_b = Temporalio::Internal::WorkflowInstance.new(act_b, wf_b, dc, "default", "test-queue")
@@ -1094,7 +1094,7 @@ describe "Workflow determinism" do
     dc = Temporalio::DataConverter::DEFAULT
     runner = Temporalio::Internal::WorkflowRunner.new(dc, "default", "test-queue")
     runner.register(Temporalio::Internal::ConcreteWorkflowDefinition(SimpleWorkflow).new)
-    runner.register(Temporalio::Internal::ConcreteWorkflowDefinition(TimerWorkflow).new)
+    runner.register(Temporalio::Internal::ConcreteWorkflowDefinition(UnitTimerWorkflow).new)
 
     # Start a timer workflow (leaves it in cache)
     timer_run = "timer-run-#{Random.new.hex(4)}"

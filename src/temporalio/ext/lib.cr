@@ -39,6 +39,26 @@ lib LibTemporalioExt
     out_error : TemporalioError*
   ) : Int32
 
+  # Async (non-blocking) RPC call - returns immediately with a handle to poll
+  type AsyncRpcHandle = Void*
+
+  fun temporalio_client_rpc_call_async(
+    client : ClientHandle,
+    service : UInt32,
+    rpc_name : UInt8*, rpc_len : LibC::SizeT,
+    request : UInt8*, request_len : LibC::SizeT,
+    out_error : TemporalioError*
+  ) : AsyncRpcHandle
+
+  # Poll async RPC handle. Returns: 0 = done, 1 = pending, -1 = error
+  fun temporalio_client_rpc_poll(
+    handle : AsyncRpcHandle,
+    out_response : ByteArray*,
+    out_error : TemporalioError*
+  ) : Int32
+
+  fun temporalio_client_rpc_handle_free(handle : AsyncRpcHandle) : Void
+
   # Worker operations
   type WorkerHandle = Void*
 

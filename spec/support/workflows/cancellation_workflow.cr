@@ -1,4 +1,4 @@
-class CancellationWorkflow
+class UnitCancellationWorkflow
   include Temporalio::Workflow
 
   workflow_name "CancellationWorkflow"

@@ -87,13 +87,14 @@ module Temporalio
 
         # Start the test server
         def start : EphemeralServer
+          Ext.init
           options = build_ffi_options
-          server = start_internal(options)
-          
-          # Clean up allocated strings
-          cleanup_ffi_options(options)
-          
-          server
+          start_internal(options)
+        end
+
+        # Called by DevServer to get the FFI options struct
+        protected def build_ffi_options_for_dev_server : TestServerOptions
+          build_ffi_options
         end
 
         private def build_ffi_options : TestServerOptions
@@ -127,43 +128,52 @@ module Temporalio
         end
 
         private def start_internal(options : TestServerOptions) : EphemeralServer
-          channel = Channel(Result).new(1)
-          box = Box.new(channel)
+          pipe_r, pipe_w = IO.pipe
+          results = [] of ServerStartResult
+
+          state = {pipe_w_fd: pipe_w.fd, results: results}
+          box = Box.new(state)
 
           callback = StartCallback.new do |user_data, server_ptr, target_ptr, error_ptr|
-            ch = Box(Channel(Result)).unbox(user_data)
-            
-            if !error_ptr.null?
+            s = Box(typeof(state)).unbox(user_data)
+            r = if !error_ptr.null?
               error = String.new(error_ptr.value.data, error_ptr.value.len)
-              ch.send(Result.new(error: error))
+              ServerStartResult.new(error: error)
             elsif !server_ptr.null? && !target_ptr.null?
               target = String.new(target_ptr.value.data, target_ptr.value.len)
-              ch.send(Result.new(server: server_ptr, target: target))
+              ServerStartResult.new(server: server_ptr, target: target)
             else
-              ch.send(Result.new(error: "Unknown error starting server"))
+              ServerStartResult.new(error: "Unknown error starting server")
             end
+            s[:results] << r
+            byte : UInt8 = 1
+            LibC.write(s[:pipe_w_fd], pointerof(byte).as(Void*), 1)
           end
 
           Lib.ephemeral_server_start_test_server(pointerof(options), box.as(Void*), callback)
-          
-          result = channel.receive
+          pipe_r.read_byte
+          pipe_r.close
+          pipe_w.close
 
-          if error = result.error
+          r = results.first
+          if error = r.error
             raise RuntimeError.new("Failed to start test server: #{error}")
-          elsif server = result.server
-            EphemeralServer.new(server.not_nil!, result.target.not_nil!)
+          elsif server = r.server
+            EphemeralServer.new(server.not_nil!, r.target.not_nil!)
           else
             raise RuntimeError.new("Unknown error starting test server")
           end
         end
 
-        private struct Result
-          property server : EphemeralServerHandle?
-          property target : String?
-          property error : String?
+      end
 
-          def initialize(@server = nil, @target = nil, @error = nil)
-          end
+      # Shared result struct for server start operations
+      private struct ServerStartResult
+        property server : EphemeralServerHandle?
+        property target : String?
+        property error : String?
+
+        def initialize(@server = nil, @target = nil, @error = nil)
         end
       end
 
@@ -192,14 +202,9 @@ module Temporalio
 
         # Start the dev server
         def start : EphemeralServer
-          test_options = @test_server.send(:build_ffi_options)
+          test_options = @test_server.build_ffi_options_for_dev_server
           options = build_ffi_options(test_options)
-          server = start_internal(options, test_options)
-          
-          # Clean up
-          @test_server.send(:cleanup_ffi_options, test_options)
-          
-          server
+          start_internal(options, test_options)
         end
 
         private def build_ffi_options(test_options : TestServerOptions) : DevServerOptions
@@ -221,31 +226,38 @@ module Temporalio
         end
 
         private def start_internal(options : DevServerOptions, test_options : TestServerOptions) : EphemeralServer
-          channel = Channel(TestServer::Result).new(1)
-          box = Box.new(channel)
+          pipe_r, pipe_w = IO.pipe
+          results = [] of ServerStartResult
+
+          state = {pipe_w_fd: pipe_w.fd, results: results}
+          box = Box.new(state)
 
           callback = StartCallback.new do |user_data, server_ptr, target_ptr, error_ptr|
-            ch = Box(Channel(TestServer::Result)).unbox(user_data)
-            
-            if !error_ptr.null?
+            s = Box(typeof(state)).unbox(user_data)
+            r = if !error_ptr.null?
               error = String.new(error_ptr.value.data, error_ptr.value.len)
-              ch.send(TestServer::Result.new(error: error))
+              ServerStartResult.new(error: error)
             elsif !server_ptr.null? && !target_ptr.null?
               target = String.new(target_ptr.value.data, target_ptr.value.len)
-              ch.send(TestServer::Result.new(server: server_ptr, target: target))
+              ServerStartResult.new(server: server_ptr, target: target)
             else
-              ch.send(TestServer::Result.new(error: "Unknown error starting server"))
+              ServerStartResult.new(error: "Unknown error starting server")
             end
+            s[:results] << r
+            byte : UInt8 = 1
+            LibC.write(s[:pipe_w_fd], pointerof(byte).as(Void*), 1)
           end
 
           Lib.ephemeral_server_start_dev_server(pointerof(options), box.as(Void*), callback)
-          
-          result = channel.receive
+          pipe_r.read_byte
+          pipe_r.close
+          pipe_w.close
 
-          if error = result.error
+          r = results.first
+          if error = r.error
             raise RuntimeError.new("Failed to start dev server: #{error}")
-          elsif server = result.server
-            EphemeralServer.new(server.not_nil!, result.target.not_nil!)
+          elsif server = r.server
+            EphemeralServer.new(server.not_nil!, r.target.not_nil!)
           else
             raise RuntimeError.new("Unknown error starting dev server")
           end
@@ -263,29 +275,31 @@ module Temporalio
         # Shutdown the server
         def shutdown
           return if @shutdown
-          
-          channel = Channel(String?).new(1)
-          box = Box.new(channel)
+
+          pipe_r, pipe_w = IO.pipe
+          errors = [] of String
+
+          state = {pipe_w_fd: pipe_w.fd, errors: errors}
+          box = Box.new(state)
 
           callback = ShutdownCallback.new do |user_data, error_ptr|
-            ch = Box(Channel(String?)).unbox(user_data)
-            
+            s = Box(typeof(state)).unbox(user_data)
             if !error_ptr.null?
-              error = String.new(error_ptr.value.data, error_ptr.value.len)
-              ch.send(error)
-            else
-              ch.send(nil)
+              s[:errors] << String.new(error_ptr.value.data, error_ptr.value.len)
             end
+            byte : UInt8 = 1
+            LibC.write(s[:pipe_w_fd], pointerof(byte).as(Void*), 1)
           end
 
           Lib.ephemeral_server_shutdown(@handle, box.as(Void*), callback)
-          
-          error = channel.receive
-          
+          pipe_r.read_byte
+          pipe_r.close
+          pipe_w.close
+
           @shutdown = true
 
-          if error
-            raise RuntimeError.new("Failed to shutdown server: #{error}")
+          if e = errors.first?
+            raise RuntimeError.new("Failed to shutdown server: #{e}")
           end
         end
 

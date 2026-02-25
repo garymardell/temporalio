@@ -1,5 +1,6 @@
 require "uuid"
 require "./bridge"
+require "./ext/lib"
 require "./internal/proto"
 require "./data_converter"
 require "./exceptions"
@@ -256,29 +257,6 @@ module Temporalio
       )
     end
 
-    # Start a workflow asynchronously (non-blocking).
-    # Returns a Future that will contain the WorkflowHandle when the start completes.
-    #
-    # This enables request pipelining - you can start multiple workflows
-    # without waiting for each one to complete before starting the next.
-    #
-    # Usage:
-    #   # Start 100 workflows in parallel
-    #   futures = 100.times.map do |i|
-    #     client.start_workflow_async("MyWorkflow", "arg#{i}",
-    #       id: "wf-#{i}", task_queue: "my-queue")
-    #   end
-    #   
-    #   # Wait for all to complete
-    #   handles = futures.map(&.get)
-    #
-    # Error handling:
-    #   future = client.start_workflow_async(...)
-    #   begin
-    #     handle = future.get
-    #   rescue ex : Temporalio::WorkflowAlreadyStartedError
-    #     # Handle duplicate workflow ID
-    #   end
     # Start a workflow and wait for the result.
     def execute_workflow(
       workflow_type : String,
@@ -441,121 +419,6 @@ module Temporalio
       results.map { |(_, handle)| handle }
     end
 
-    # Start multiple workflows with request pipelining for maximum throughput.
-    # This is 2-3x faster than batch_start_workflows because it doesn't wait
-    # for each start response before sending the next request.
-    #
-    # Returns an array of Futures that will contain WorkflowHandles.
-    # Errors are captured in the futures - check each future's result.
-    #
-    # Usage:
-    #   requests = 1000.times.map { |i|
-    #     {
-    #       workflow_type: "MyWorkflow",
-    #       args: ["arg#{i}"],
-    #       id: "wf-#{i}",
-    #       task_queue: "my-queue"
-    #     }
-    #   }
-    #   
-    #   # Start all (non-blocking, pipelined)
-    #   futures = client.start_workflows_pipelined(requests)
-    #   
-    #   # Wait for all and handle errors
-    #   results = Async.await_all_settled(futures)
-    #   results.each_with_index do |result, i|
-    #     if result[:success]
-    #       puts "Workflow #{i}: Started with handle #{result[:value]}"
-    #     else
-    #       puts "Workflow #{i}: Failed - #{result[:error]}"
-    #     end
-    #   end
-    def start_workflows_pipelined(
-      requests : Array(NamedTuple(
-        workflow_type: String,
-        args: Array,
-        id: String,
-        task_queue: String,
-        execution_timeout: Time::Span?,
-        run_timeout: Time::Span?,
-        task_timeout: Time::Span?,
-        id_reuse_policy: Int32,
-        id_conflict_policy: Int32,
-        retry_policy: RetryPolicy?,
-        cron_schedule: String?,
-        memo: Hash(String, String)?,
-        search_attributes: Hash(String, String)?,
-        start_delay: Time::Span?,
-        request_id: String?
-      ) | NamedTuple(
-        workflow_type: String,
-        args: Array,
-        id: String,
-        task_queue: String
-      ))
-    ) : Array(Async::Future(WorkflowHandle))
-      requests.map do |req|
-        # Extract params with defaults
-        execution_timeout = req[:execution_timeout]? || nil
-        run_timeout = req[:run_timeout]? || nil
-        task_timeout = req[:task_timeout]? || nil
-        id_reuse_policy = req[:id_reuse_policy]? || 0
-        id_conflict_policy = req[:id_conflict_policy]? || 0
-        retry_policy = req[:retry_policy]? || nil
-        cron_schedule = req[:cron_schedule]? || nil
-        memo = req[:memo]? || nil
-        search_attributes = req[:search_attributes]? || nil
-        start_delay = req[:start_delay]? || nil
-        request_id = req[:request_id]? || nil
-        
-        # Create async future for each workflow
-        future = Async::Future(WorkflowHandle).new
-        
-        spawn do
-          begin
-            # Build the start request
-            input_payloads = req[:args].map { |a| @data_converter.to_payload(a).as(Temporal::Api::Common::V1::Payload) }
-            
-            start_req = Temporal::Api::Workflowservice::V1::StartWorkflowExecutionRequest.new(
-              namespace: @namespace,
-              workflow_id: req[:id],
-              workflow_type: Temporal::Api::Common::V1::WorkflowType.new(name: req[:workflow_type]),
-              task_queue: Temporal::Api::Taskqueue::V1::TaskQueue.new(name: req[:task_queue]),
-              input: input_payloads.empty? ? nil : Temporal::Api::Common::V1::Payloads.new(payloads: input_payloads),
-              workflow_execution_timeout: span_to_duration(execution_timeout),
-              workflow_run_timeout: span_to_duration(run_timeout),
-              workflow_task_timeout: span_to_duration(task_timeout),
-              identity: @identity,
-              request_id: request_id || UUID.random.to_s,
-              workflow_id_reuse_policy: id_reuse_policy,
-              workflow_id_conflict_policy: id_conflict_policy,
-              retry_policy: retry_policy ? convert_retry_policy(retry_policy) : nil,
-              cron_schedule: cron_schedule,
-              memo: memo ? build_memo(memo) : nil,
-              search_attributes: search_attributes ? build_search_attributes(search_attributes) : nil,
-              workflow_start_delay: span_to_duration(start_delay)
-            )
-            
-            resp_bytes = workflow_service_call("StartWorkflowExecution", start_req.to_protobuf.to_slice)
-            resp = Temporal::Api::Workflowservice::V1::StartWorkflowExecutionResponse.from_protobuf(IO::Memory.new(resp_bytes))
-            
-            handle = WorkflowHandle.new(
-              client: self,
-              workflow_id: req[:id],
-              run_id: resp.run_id,
-              result_run_id: resp.run_id
-            )
-            
-            future.set(handle)
-          rescue ex
-            future.set_error(ex)
-          end
-        end
-        
-        future
-      end
-    end
-
     # Get a handle to an existing workflow (by ID, optionally with run ID).
     def workflow_handle(workflow_id : String, run_id : String? = nil) : WorkflowHandle
       WorkflowHandle.new(
@@ -619,6 +482,33 @@ module Temporalio
         )
       else
         raise "No client or pool available"
+      end
+    end
+
+    # Internal: start an async (non-blocking) workflow service RPC call.
+    # Returns an async handle. Poll with workflow_service_call_poll. Free with workflow_service_call_free.
+    # Only available when using a direct (non-pool) client.
+    protected def workflow_service_call_async(rpc_name : String, request_bytes : Bytes) : LibTemporalioExt::AsyncRpcHandle
+      if client = @bridge_client
+        client.rpc_call_async(:workflow, rpc_name, request_bytes)
+      else
+        raise "Async RPC not available with connection pool"
+      end
+    end
+
+    # Poll an async workflow service RPC handle. Returns bytes when done, nil if pending.
+    protected def workflow_service_call_poll(handle : LibTemporalioExt::AsyncRpcHandle) : Bytes?
+      if client = @bridge_client
+        client.rpc_poll_async(handle)
+      else
+        raise "Async RPC not available with connection pool"
+      end
+    end
+
+    # Free an async workflow service RPC handle.
+    protected def workflow_service_call_free(handle : LibTemporalioExt::AsyncRpcHandle) : Nil
+      if client = @bridge_client
+        client.rpc_free_async(handle)
       end
     end
 
